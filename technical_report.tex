@@ -115,13 +115,7 @@ Our inference pipeline processes each document image through five stages
 \begin{figure}[H]
   \centering
   % PLACEHOLDER: replace with pipeline diagram
-  % \includegraphics[width=\textwidth]{figures/pipeline_diagram.pdf}
-  \fbox{\parbox{0.9\textwidth}{\centering\vspace{3cm}
-    \textbf{[PLACEHOLDER: Pipeline diagram]}\\[0.5em]
-    Image $\rightarrow$ Face detect $\rightarrow$ Face classify $\rightarrow$ photo\_prob\\
-    Image $\rightarrow$ PaddleOCR $\rightarrow$ Field crops $\rightarrow$ Forensic panels $\rightarrow$ ConvNeXt-B $\rightarrow$ text\_prob\\
-    fraud\_score = max(photo\_prob, text\_prob)
-  \vspace{1cm}}}
+  \includegraphics[width=\textwidth]{figures/pipeline_diagram.png}}
   \caption{End-to-end inference pipeline. Two branches operate independently and
            their scores are combined via max.}
   \label{fig:pipeline}
@@ -211,14 +205,7 @@ processed into six grayscale views arranged in a $2 \times 3$ grid:
 \begin{figure}[H]
   \centering
   % PLACEHOLDER: forensic panel examples
-  % \includegraphics[width=\textwidth]{figures/forensic_panel_example.pdf}
-  \fbox{\parbox{0.9\textwidth}{\centering\vspace{5cm}
-    \textbf{[PLACEHOLDER: Forensic panel examples]}\\[0.5em]
-    Show 2--3 panels side by side:\\
-    (a) genuine field panel --- uniform views, no anomalies\\
-    (b) tampered field panel --- visible artifacts in ink mask, L residual, edge views\\
-    Label each of the 6 views.
-  \vspace{1cm}}}
+  \includegraphics[width=\textwidth]{figures/forensic_panel_example.png}}
   \caption{Six-view forensic panels. Top row: grayscale, ink mask, $|L|$ residual.
            Bottom row: chroma residual, texture variance, edge magnitude.
            Tampered fields show visible anomalies in residual and edge views.}
@@ -526,12 +513,7 @@ distributions while losing generalization on real document scoring.
 \begin{figure}[H]
   \centering
   % PLACEHOLDER: training curves
-  % \includegraphics[width=0.8\textwidth]{figures/training_curves.pdf}
-  \fbox{\parbox{0.8\textwidth}{\centering\vspace{4cm}
-    \textbf{[PLACEHOLDER: Training curves]}\\[0.5em]
-    Plot: loss, panel AUC, doc AUC, FREUID per epoch.
-    Annotate epoch 2 as selected checkpoint.
-  \vspace{1cm}}}
+  \includegraphics[width=0.9\textwidth]{figures/training_curves.png}}
   \caption{Training progression showing panel AUC vs document FREUID divergence
            after epoch~2.}
   \label{fig:training_curves}
@@ -641,14 +623,7 @@ and PaddlePaddle (PaddleOCR) were instrumental to this solution.
 \begin{figure}[H]
   \centering
   % PLACEHOLDER: per-field prediction heatmap on a document
-  % \includegraphics[width=\textwidth]{figures/field_heatmap.pdf}
-  \fbox{\parbox{0.9\textwidth}{\centering\vspace{5cm}
-    \textbf{[PLACEHOLDER: Per-field prediction heatmap]}\\[0.5em]
-    Show a document image with each PaddleOCR field box overlaid,
-    colored by the ConvNeXt-B probability (green$\rightarrow$red colormap).
-    Show one genuine document (all green) and one tampered document
-    (one red field among green fields).
-  \vspace{1cm}}}
+  \includegraphics[width=\textwidth]{figures/field_heatmap.png}}
   \caption{Per-field tamper probability overlay. Left: genuine document
            (all fields score $<0.1$). Right: tampered document (one field
            scores $>0.95$, others $<0.1$).}
