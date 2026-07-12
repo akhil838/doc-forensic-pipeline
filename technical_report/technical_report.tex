@@ -68,7 +68,7 @@ All code, weights, and annotations are released for full reproducibility.
 \noindent\textbf{Competition:} The FREUID Challenge 2026 (IJCAI-ECAI 2026)\\
 \textbf{Kaggle team:} \kaggleteam\\
 \textbf{Code:} \url{https://github.com/akhil838/doc-forensic-pipeline}\\
-\hspace*{1.5cm}(commit \texttt{c3a7d9ff})\\
+\hspace*{1.5cm}(commit \texttt{0d51c75d})\\
 \textbf{Weights:} \url{https://huggingface.co/akhil838/doc-forensic-models-v1}\\
 % ============================================================================
 \section{Introduction}
@@ -102,7 +102,7 @@ Our inference pipeline processes each document image through five stages
         a standardized portrait crop ($256 \times 320$), resized to
         $224 \times 224$, and classified by a DINOv2-small model
         (1.2\,ms/face, GPU).
-  \item \textbf{Text field detection} --- PaddleOCR PP-OCRv6 detects all text
+  \item \textbf{Text field detection} --- PaddleOCR PP-OCRv6~\cite{paddleocr} detects all text
         field bounding boxes (35\,ms/image, GPU).
   \item \textbf{Forensic panel scoring} --- Each filtered text field is cropped
         with context padding, converted to a $224 \times 1008$ six-view forensic
@@ -123,13 +123,13 @@ Our inference pipeline processes each document image through five stages
 
 \subsection{Face detection and classification}
 
-We use MediaPipe BlazeFace for face detection, selecting the largest left-side
+We use MediaPipe BlazeFace~\cite{blazeface,mediapipe} for face detection, selecting the largest left-side
 face (primary portrait region). The detected face square is expanded by a factor
 of $2.15\times$ to capture the full portrait area, then regularized to a stable
 document-height fraction ($42$--$72\%$) with fixed $256{:}320$ aspect ratio.
 When no face is detected, a generic left-side portrait fallback crop is used.
 
-The portrait crop is classified by a DINOv2-small backbone
+The portrait crop is classified by a DINOv2-small backbone~\cite{dinov2}
 (\texttt{facebook/dinov2-small}, 22M parameters) with a
 LayerNorm$(384)$ $\rightarrow$ Dropout$(0.1)$ $\rightarrow$ Linear$(384, 2)$ head.
 All backbone parameters are trainable with differential learning rates
@@ -209,7 +209,7 @@ processed into six grayscale views arranged in a $2 \times 3$ grid:
 
 \subsection{Text tamper classifier (ConvNeXt-Base)}
 
-The forensic panels are classified by a ConvNeXt-Base backbone initialized from
+The forensic panels are classified by a ConvNeXt-Base backbone~\cite{convnextv2} initialized from
 {\small\texttt{facebook/dinov3-convnext-base-pretrain-lvd1689m}} (88M parameters).
 The last 2 ConvNeXt stages and the layer normalization are unfrozen during
 fine-tuning; earlier stages remain frozen.
@@ -405,13 +405,12 @@ the full pipeline described in Section~\ref{sec:method}.
 
 The Docker container is built from \texttt{nvidia/cuda:12.8.0-runtime-ubuntu22.04}
 with Python~3.12 managed by \texttt{uv}.
-All model weights and PaddleOCR detection models are baked into the image
-(no runtime downloads).
-HuggingFace model configs are pre-cached at build time; inference runs with
-\texttt{TRANSFORMERS\_OFFLINE=1}.
+All model weights, PaddleOCR detection models, and HuggingFace model configs
+are baked into the image (no runtime or build-time downloads from HuggingFace).
+Inference runs with \texttt{TRANSFORMERS\_OFFLINE=1}.
 
 \begin{verbatim}
-docker build --build-arg HF_TOKEN=hf_xxx -t freuid-repro .
+docker build -t freuid-repro .
 docker run --rm --gpus all --network none \
   -v /path/to/images:/data:ro \
   -v $(pwd)/out:/submissions \
@@ -506,11 +505,11 @@ distributions while losing generalization on real document scoring.
 
 \begin{itemize}[noitemsep]
   \item \textbf{Repository:} \url{https://github.com/akhil838/doc-forensic-pipeline},
-        commit \texttt{c3a7d9ff}.
+        commit \texttt{0d51c75d}.
   \item \textbf{Weights:} \url{https://huggingface.co/akhil838/doc-forensic-models-v1}
         (520\,MB total: ConvNeXt-B 336\,MB, DINOv2-small 85\,MB, BlazeFace 225\,KB,
         PaddleOCR 59\,MB).
-  \item \textbf{Docker:} \texttt{docker build --build-arg HF\_TOKEN=... -t freuid-repro .}
+  \item \textbf{Docker:} \texttt{docker build -t freuid-repro .}
         followed by \texttt{docker run --network none --gpus all}.
   \item \textbf{Dependencies:} Python 3.12, PyTorch 2.11+cu128, PaddlePaddle 3.3,
         transformers $\geq$5.10, timm 1.0.27. Full list in \texttt{requirements.txt}.

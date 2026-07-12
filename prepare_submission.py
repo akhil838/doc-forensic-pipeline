@@ -19,10 +19,11 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 os.environ.setdefault("PADDLEX_HOME", "/models/paddleocr_cache")
 
-# Add inference/ to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "inference"))
+# Add inference/ to path so run_inference resolves at runtime (Docker, CLI)
+_inference_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inference")
+sys.path.insert(0, _inference_dir)
 
-from run_inference import main as run_main
+from run_inference import main as run_main  # noqa: E402 — path injected above
 
 if __name__ == "__main__":
     # Inject Docker sandbox defaults into sys.argv if not already provided
