@@ -84,14 +84,22 @@ class DINOClassifier(nn.Module):
     def __init__(self, n_classes: int = 2,
                  model_name: str = "facebook/dinov2-small",
                  dropout: float = 0.1,
-                 freeze_backbone: bool = False):
+                 freeze_backbone: bool = False,
+                 config_dir: str | None = None):
         super().__init__()
         import os
-        from transformers import AutoModel
+        from pathlib import Path
+        from transformers import AutoModel, AutoConfig
 
-        token = os.environ.get("HF_TOKEN")
-        kwargs = {"token": token} if token else {}
-        self.backbone = AutoModel.from_pretrained(model_name, **kwargs)
+        # Try local config first, fallback to HF
+        local_config = Path(config_dir) if config_dir else Path(__file__).parent / "configs" / "dinov2_small"
+        if local_config.exists():
+            config = AutoConfig.from_pretrained(str(local_config))
+            self.backbone = AutoModel.from_config(config)
+        else:
+            token = os.environ.get("HF_TOKEN")
+            kwargs = {"token": token} if token else {}
+            self.backbone = AutoModel.from_pretrained(model_name, **kwargs)
         hidden = self.backbone.config.hidden_size  # 384
         if freeze_backbone:
             for p in self.backbone.parameters():

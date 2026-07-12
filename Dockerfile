@@ -50,17 +50,7 @@ RUN uv pip install --system --no-cache \
 COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt
 
-# Pre-cache HuggingFace model configs (network available at build time)
-# dinov3-convnext-base is gated — pass token as build arg
-ARG HF_TOKEN
-RUN python -c "import os; os.environ['HF_TOKEN']=os.environ.get('HF_TOKEN',''); \
-    from transformers import AutoModel; \
-    token = os.environ.get('HF_TOKEN') or None; \
-    AutoModel.from_pretrained('facebook/dinov2-small'); \
-    AutoModel.from_pretrained('facebook/dinov3-convnext-base-pretrain-lvd1689m', token=token); \
-    print('HF models cached')"
-
-# Offline mode: no downloads at runtime
+# Offline mode: no downloads at runtime (configs are local, weights are baked in)
 ENV TRANSFORMERS_OFFLINE=1 \
     HF_HUB_OFFLINE=1 \
     PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
@@ -69,6 +59,7 @@ ENV TRANSFORMERS_OFFLINE=1 \
 COPY inference/ /app/inference/
 COPY train/scripts/ /app/train/scripts/
 COPY models/__init__.py models/models.py /app/models/
+COPY models/configs/ /app/models/configs/
 COPY prepare_submission.py /app/
 
 # Model weights + PaddleOCR cache — baked into image, no runtime downloads
