@@ -50,11 +50,14 @@ RUN uv pip install --system --no-cache \
 COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt
 
-# Pre-cache HuggingFace models (network available at build time)
-# These get saved to /root/.cache/huggingface and loaded offline at runtime
-RUN python -c "from transformers import AutoModel; \
+# Pre-cache HuggingFace model configs (network available at build time)
+# dinov3-convnext-base is gated — pass token as build arg
+ARG HF_TOKEN
+RUN python -c "import os; os.environ['HF_TOKEN']=os.environ.get('HF_TOKEN',''); \
+    from transformers import AutoModel; \
+    token = os.environ.get('HF_TOKEN') or None; \
     AutoModel.from_pretrained('facebook/dinov2-small'); \
-    AutoModel.from_pretrained('facebook/dinov3-convnext-base-pretrain-lvd1689m'); \
+    AutoModel.from_pretrained('facebook/dinov3-convnext-base-pretrain-lvd1689m', token=token); \
     print('HF models cached')"
 
 # Offline mode: no downloads at runtime
