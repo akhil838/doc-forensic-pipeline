@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+.git
+.env
+*.log
+technical_report/
+REPLY_TEMPLATE.txt
+README.md
+references.bib
+*.tex

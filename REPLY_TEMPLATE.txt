@@ -1,0 +1,17 @@
+---
+FREUID Challenge 2026 — Reproducibility Package
+---
+
+Team name: [Kaggle team name]
+Kaggle usernames: [comma-separated]
+Final Kaggle submission: [label / date-time as shown on Kaggle]
+
+Repository (this should be public git repository): [URL]
+Commit SHA: [40-char hash]
+Technical report (PDF): [URL]
+
+We confirm this repository at the stated commit reproduces our selected final
+submission and complies with the competition rules.
+
+Signed (team captain): [Kaggle username]
+Date (UTC): [YYYY-MM-DD]

@@ -1,0 +1,27 @@
+# Weights (hosted on HuggingFace: akhil838/doc-forensic-models-v1)
+models/weights/
+*.pt
+*.tflite
+*.pdiparams
+*.onnx
+
+# Cache
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Training artifacts
+training_panels/
+*.pkl
+
+# Paddle box cache
+annotations/paddle_cache/
+
+# Logs and predictions
+*.log
+submission_*.csv
+field_predictions_*.csv
+
+# OS
+.DS_Store
+Thumbs.db

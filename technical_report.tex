@@ -1,0 +1,268 @@
+% FREUID Challenge 2026 — Technical Report
+% Compile: pdflatex technical_report.tex && bibtex technical_report && pdflatex x2
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+\geometry{margin=2.5cm}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black,
+}
+
+\newcommand{\teamname}{[Team Name]}
+\newcommand{\kaggleteam}{[Kaggle Team Name]}
+\newcommand{\contactemail}{[email@example.com]}
+\newcommand{\reportdate}{\today}
+
+\title{%
+  \textbf{The FREUID Challenge 2026}\\[0.4em]
+  \large Technical Report --- \teamname
+}
+\author{%
+  [Author Name]\textsuperscript{1}\\
+  \small
+  \textsuperscript{1}[Affiliation]\\
+  \texttt{\contactemail}
+}
+\date{Report date: \reportdate}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present a forensic text-field analysis pipeline for identity document fraud detection.
+Our approach detects text regions via PaddleOCR, extracts six-view forensic panels
+(grayscale, ink mask, luminance residual, chroma residual, texture variance, edge magnitude),
+and classifies each panel with a fine-tuned ConvNeXt-Base backbone.
+Document-level fraud scores are computed as top-3 mean of per-field tamper probabilities.
+On the FREUID public leaderboard, our best single model achieves FREUID=0.0078
+with APCER@1\%BPCER of 1.3\%. The pipeline runs in approximately 3--5 hours
+on an NVIDIA A100 for 142k documents. Code and weights are open-sourced for full reproducibility.
+\end{abstract}
+
+\noindent\textbf{Competition:} The FREUID Challenge 2026 (IJCAI-ECAI 2026)\\
+\textbf{Kaggle team:} \kaggleteam\\
+\textbf{Code:} \url{https://github.com/[FILL]/freuid-2026} (commit \texttt{[SHA]})\\
+
+\section{Introduction}
+\label{sec:intro}
+
+The FREUID Challenge targets next-generation identity document fraud detection
+spanning physical manipulations, GenAI-driven digital edits, and print-and-capture attacks.
+Documents cover five country/document types: Egypt/DL, Guinea/DL, Benin/DL, Mauritius/ID,
+and Mozambique/DL.
+
+Our key insight: text-field tampering leaves detectable artifacts in \emph{local} image
+forensic features (background residuals, ink consistency, edge halos, texture variance)
+that generalize across document types. Rather than training on full document images, we
+decompose each document into per-field forensic panels and train a field-level classifier.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Overview}
+
+The pipeline has four stages:
+\begin{enumerate}[noitemsep]
+  \item \textbf{Text detection:} PaddleOCR PP-OCRv6 detects text-field bounding boxes.
+  \item \textbf{Forensic panel generation:} Each text crop (with 15px horizontal and 10px vertical
+        context padding) is converted to a $224 \times 1008$ six-view composite.
+  \item \textbf{Field classification:} A fine-tuned ConvNeXt-Base produces per-field tamper probability.
+  \item \textbf{Document scoring:} Top-3 mean of field probabilities yields the document fraud score.
+\end{enumerate}
+
+\subsection{Forensic panel generation}
+
+Each text field crop is letterboxed to $112 \times 336$ and processed into six views arranged
+in a $2 \times 3$ grid ($224 \times 1008$):
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{lll}
+    \toprule
+    Grayscale & Ink mask (adaptive threshold) & $|L|$ residual (background-subtracted) \\
+    Chroma residual ($\sqrt{A'^2 + B'^2}$) & Texture variance (local $\sigma$) & Edge magnitude (Sobel) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Background subtraction uses Gaussian blur ($\sigma = \max(8, \min(W,H)/8)$) in CIELAB space.
+The ink mask combines adaptive thresholding ($\text{gray} < \text{local\_mean} - 22$ and $< 175$)
+with a fixed dark threshold ($< 80$), followed by $3 \times 3$ dilation.
+
+\subsection{Model architecture}
+
+\textbf{Primary model:} ConvNeXt-Base backbone from
+\texttt{facebook/dinov3-convnext-base-pretrain-lvd1689m} (88M parameters, hidden=1024).
+Last 2 stages unfrozen during fine-tuning. Classification head: Linear(1024, 256) $\to$ GELU $\to$
+Dropout(0.15) $\to$ Linear(256, 1).
+
+\textbf{Fallback model:} EfficientNet-B0 via timm (4.3M parameters, hidden=1280).
+Last 2 stages unfrozen. Same head architecture with Dropout(0.2).
+
+\subsection{Training objective and procedure}
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Loss:} BCEWithLogitsLoss with pos\_weight=1.5 (mild upweighting of tampered fields)
+  \item \textbf{Optimizer:} AdamW, lr=$3 \times 10^{-4}$, weight decay=0.02
+  \item \textbf{Schedule:} Cosine annealing over all training steps
+  \item \textbf{Epochs:} 8, best checkpoint selected by public AUC
+  \item \textbf{Gradient clipping:} max norm 1.0
+  \item \textbf{Augmentations:} Random hue shift ($\pm 25$), horizontal flip (50\%), vertical flip (30\%)
+  \item \textbf{Batch size:} 12 (ConvNeXt-B) or 24--32 (smaller models)
+\end{itemize}
+
+\subsection{Training data: forensic panels}
+
+Training panels come from two sources:
+\begin{enumerate}[noitemsep]
+  \item \textbf{Real tampered fields:} PaddleOCR boxes from competition train images with
+        \texttt{label=1} (text-tampered documents). Weak labels: not every field in a
+        tampered document is actually tampered.
+  \item \textbf{Synthetic fakes:} Seven tamper effects applied to genuine text fields
+        (ink replacement, background color shift, font mismatch, copy-paste, blur/sharpen,
+        JPEG recompression, multi-effect combos). 65\% single effect, 28\% two-effect combo,
+        7\% three-effect combo. $\sim$49k total panels (balanced real/synthetic).
+\end{enumerate}
+
+\subsection{Score calibration}
+
+Raw model output is a logit; we apply sigmoid to get $[0,1]$ probabilities per field.
+Document score = mean of top-3 field probabilities (sorted descending).
+No additional calibration or post-processing.
+
+\section{Data}
+\label{sec:data}
+
+\subsection{FREUID training set}
+All 85 training images used. Split by country/type for country classification,
+then per-type subtask annotations (photo\_cutout, details\_tamper) for targeted scoring.
+
+\subsection{External data and pre-trained models}
+
+\begin{itemize}[noitemsep]
+  \item \texttt{facebook/dinov3-convnext-base-pretrain-lvd1689m} (Apache 2.0) — backbone initialization
+  \item PaddleOCR PP-OCRv6 (Apache 2.0) — text detection
+  \item MediaPipe BlazeFace (Apache 2.0) — face detection
+  \item EfficientNet-B0 ImageNet weights via timm (Apache 2.0) — fallback model
+\end{itemize}
+
+No external training data beyond the FREUID competition dataset and publicly licensed
+pre-trained weights.
+
+\subsection{Validation strategy}
+90/10 random split of training panels for per-epoch validation AUC.
+Public leaderboard score used for model selection (best epoch checkpoint).
+Private test labels not used for model selection.
+
+\section{Inference}
+\label{sec:inference}
+
+Test-time pipeline per image:
+\begin{enumerate}[noitemsep]
+  \item Read image, detect text boxes with PaddleOCR TextDetection
+  \item For each box: crop with context padding $\to$ forensic panel (224$\times$1008)
+  \item Batch panels through model with FP32 (or FP16 autocast on GPU)
+  \item Document score = top-3 mean of field sigmoid probabilities
+\end{enumerate}
+
+Docker entrypoint: \texttt{python prepare\_submission.py} reads \texttt{/data/} and writes
+\texttt{/submissions/submission.csv}.
+
+Hardware: NVIDIA A100-40GB. Estimated 3--5 hours for 142k documents.
+CPU fallback available but significantly slower ($\sim$24h).
+
+\section{Results}
+\label{sec:results}
+
+\begin{table}[h]
+  \centering
+  \caption{Model comparison on public test (1,769 documents, 31,860 fields).}
+  \label{tab:results}
+  \begin{tabular}{lccccc}
+    \toprule
+    Model & Params & FREUID $\downarrow$ & APCER@1\% & PUB AUC & T4 est. \\
+    \midrule
+    ConvNeXt-B (DINOv3)  & 88M  & \textbf{0.0078} & 1.3\% & 0.9997 & 9.1h \\
+    EfficientNet-B0      & 4.3M & 0.0141          & 2.5\% & 0.9973 & 0.7h \\
+    EfficientNet-B1      & 6.8M & 0.0175          & 3.0\% & 0.9956 & 1.1h \\
+    HGNetV2-B1           & 4.8M & 0.0284          & 4.7\% & 0.9910 & 0.5h \\
+    RepViT-M1            & 4.8M & 0.0287          & 5.4\% & 0.9976 & 0.7h \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[h]
+  \centering
+  \caption{Submission summary.}
+  \label{tab:submission}
+  \begin{tabular}{lcc}
+    \toprule
+    Split / Leaderboard & FREUID $\downarrow$ & Notes \\
+    \midrule
+    Local validation      & [0.xxx] & 10\% held-out panels \\
+    Public leaderboard    & 0.0078  & Selected final submission \\
+    Private (if known)    & [--]    & At submission time \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{Reproducibility}
+\label{sec:repro}
+\begin{itemize}[noitemsep]
+  \item \textbf{Repository:} [URL] + frozen commit SHA.
+  \item \textbf{Docker:} \texttt{docker build -t freuid-repro:latest .} ; weights baked in via \texttt{COPY models/ /models/}.
+  \item \textbf{Dependencies:} Python 3.11, PyTorch 2.11+cu128, PaddlePaddle 3.3, transformers, timm.
+  \item \textbf{Runtime:} A100-40GB, $\sim$3--5h for 142k images.
+  \item \textbf{Randomness:} SEED=42; inference is deterministic.
+  \item \textbf{Network:} Verified with \texttt{docker run --network none}.
+\end{itemize}
+
+\section{Team and contributions}
+[Author Name]: modeling, data pipeline, training, Docker packaging, technical report.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\appendix
+\section{Hyperparameters}
+\label{app:hparams}
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabular}{ll}
+    \toprule
+    Hyperparameter & Value \\
+    \midrule
+    Panel size & 224 $\times$ 1008 (6 views of 112 $\times$ 336) \\
+    Backbone & ConvNeXt-Base (dinov3-lvd1689m) \\
+    Unfrozen stages & Last 2 \\
+    Hidden dim & 1024 \\
+    Head & Linear(1024,256) $\to$ GELU $\to$ Drop(0.15) $\to$ Linear(256,1) \\
+    Batch size & 12 \\
+    Learning rate & $3 \times 10^{-4}$ \\
+    Weight decay & 0.02 \\
+    Epochs & 8 \\
+    Pos weight & 1.5 \\
+    Seed & 42 \\
+    Aggregation & Top-3 mean \\
+    Top OCR ignore & 6\% (skip document header band) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\end{document}
