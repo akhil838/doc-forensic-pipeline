@@ -361,7 +361,10 @@ display(pd.crosstab(val_df['type'], val_df['label']))
 class DINOClassifier(nn.Module):
     def __init__(self, n_classes=2, model_name=DINO_MODEL_NAME, dropout=0.1):
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(model_name)
+        import os
+        token = os.environ.get("HF_TOKEN")
+        kwargs = {"token": token} if token else {}
+        self.backbone = AutoModel.from_pretrained(model_name, **kwargs)
         hidden = self.backbone.config.hidden_size
         if DINO_FREEZE_BACKBONE:
             for p in self.backbone.parameters():

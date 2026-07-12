@@ -31,6 +31,10 @@
 ## Prerequisites
 
 ```bash
+# HuggingFace token (required for gated models like dinov3-convnext-base)
+# Get token from https://huggingface.co/settings/tokens (read access)
+export HF_TOKEN=hf_your_token_here
+
 # GPU (A100/T4)
 pip install torch==2.11.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/

@@ -21,9 +21,11 @@ class DINOv3Classifier(nn.Module):
     def __init__(self, unfreeze_blocks: int = 2, dropout: float = 0.15,
                  hf_token: str | None = None):
         super().__init__()
+        import os
         from transformers import AutoModel
 
-        kwargs = {"token": hf_token} if hf_token else {}
+        token = hf_token or os.environ.get("HF_TOKEN")
+        kwargs = {"token": token} if token else {}
         self.backbone = AutoModel.from_pretrained(
             "facebook/dinov3-convnext-base-pretrain-lvd1689m", **kwargs
         )
@@ -124,9 +126,12 @@ class DINOClassifier(nn.Module):
                  dropout: float = 0.1,
                  freeze_backbone: bool = False):
         super().__init__()
+        import os
         from transformers import AutoModel
 
-        self.backbone = AutoModel.from_pretrained(model_name)
+        token = os.environ.get("HF_TOKEN")
+        kwargs = {"token": token} if token else {}
+        self.backbone = AutoModel.from_pretrained(model_name, **kwargs)
         hidden = self.backbone.config.hidden_size  # 384
         if freeze_backbone:
             for p in self.backbone.parameters():
