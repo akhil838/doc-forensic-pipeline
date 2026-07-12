@@ -26,16 +26,22 @@ class DINOv3Classifier(nn.Module):
     """
 
     def __init__(self, unfreeze_blocks: int = 2, dropout: float = 0.15,
-                 hf_token: str | None = None):
+                 config_dir: str | None = None):
         super().__init__()
         import os
-        from transformers import AutoModel
+        from pathlib import Path
+        from transformers import AutoModel, AutoConfig
 
-        token = hf_token or os.environ.get("HF_TOKEN")
-        kwargs = {"token": token} if token else {}
-        self.backbone = AutoModel.from_pretrained(
-            "facebook/dinov3-convnext-base-pretrain-lvd1689m", **kwargs
-        )
+        # Try local config first (no HF download needed), fallback to HF
+        local_config = Path(config_dir) if config_dir else Path(__file__).parent / "configs" / "dinov3_convnext_base"
+        if local_config.exists():
+            config = AutoConfig.from_pretrained(str(local_config))
+            self.backbone = AutoModel.from_config(config)
+        else:
+            token = os.environ.get("HF_TOKEN")
+            kwargs = {"token": token} if token else {}
+            self.backbone = AutoModel.from_pretrained(
+                "facebook/dinov3-convnext-base-pretrain-lvd1689m", **kwargs)
         hidden = self.backbone.config.hidden_sizes[-1]  # 1024
 
         # Freeze everything

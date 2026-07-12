@@ -1,9 +1,4 @@
 # Weights (hosted on HuggingFace: akhil838/doc-forensic-models-v1)
-models/weights/
-*.pt
-*.tflite
-*.pdiparams
-*.onnx
 
 # Cache
 __pycache__/
