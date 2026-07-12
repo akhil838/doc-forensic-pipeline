@@ -141,12 +141,7 @@ validation.
 \begin{figure}[H]
   \centering
   % PLACEHOLDER: face detection + crop examples
-  % \includegraphics[width=\textwidth]{figures/face_detection_examples.pdf}
-  \fbox{\parbox{0.9\textwidth}{\centering\vspace{4cm}
-    \textbf{[PLACEHOLDER: Face detection examples]}\\[0.5em]
-    Show 4--6 documents with detected face box (green), portrait crop (blue),
-    and predicted label (real/fake) for each country type.
-  \vspace{1cm}}}
+  \includegraphics[width=\textwidth]{figures/face_detection_examples.png}
   \caption{Face detection and portrait crop extraction across document types.}
   \label{fig:face_examples}
 \end{figure}
@@ -281,12 +276,7 @@ sensor noise, JPEG recompression) is applied to all synthetic panels.
 \begin{figure}[H]
   \centering
   % PLACEHOLDER: synthetic effect examples
-  % \includegraphics[width=\textwidth]{figures/synth_effects_grid.pdf}
-  \fbox{\parbox{0.9\textwidth}{\centering\vspace{5cm}
-    \textbf{[PLACEHOLDER: Synthetic tamper effect examples]}\\[0.5em]
-    3$\times$3 grid showing each of the 9 effects applied to the same field crop.
-    Label each effect name. Show original clean crop in the center or as header.
-  \vspace{1cm}}}
+  \includegraphics[width=\textwidth]{figures/synth_effects_grid.png}
   \caption{Nine synthetic tamper effects used for training data augmentation.}
   \label{fig:synth_effects}
 \end{figure}
@@ -405,15 +395,7 @@ the full pipeline described in Section~\ref{sec:method}.
 \begin{figure}[H]
   \centering
   % PLACEHOLDER: inference examples showing predictions
-  % \includegraphics[width=\textwidth]{figures/inference_examples.pdf}
-  \fbox{\parbox{0.9\textwidth}{\centering\vspace{5cm}
-    \textbf{[PLACEHOLDER: Inference prediction examples]}\\[0.5em]
-    Show 4--6 test documents with:\\
-    - Face detection box + photo\_prob score\\
-    - PaddleOCR field boxes colored by field\_prob (green=low, red=high)\\
-    - Final fraud\_score\\
-    Include both correct predictions and failure cases.
-  \vspace{1cm}}}
+  \includegraphics[width=\textwidth]{figures/inference_examples.png}
   \caption{Inference predictions on sample documents showing face detection
            (blue box), field scores (green=genuine, red=tampered), and
            final fraud score.}
