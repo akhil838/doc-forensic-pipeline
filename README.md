@@ -1,94 +1,120 @@
-# FREUID Challenge 2026 — Reproducibility Package
+# Document Forensic Pipeline
 
-## Solution overview
+Two-branch fraud detection for identity documents: face/photo tampering + text field tampering.
 
-Binary fraud detection on identity documents. Pipeline:
+**Public leaderboard: 0.294** (FREUID score, lower is better)
 
-1. **PaddleOCR TextDetection** — detect text field boxes per document
-2. **Forensic panel generation** — each text crop → 224×1008 six-view composite (grayscale, ink mask, luminance residual, chroma residual, texture variance, edge magnitude)
-3. **ConvNeXt-Base classifier** — fine-tuned on forensic panels (FREUID=0.0078 on public LB)
-4. **Score aggregation** — top-3 mean of per-field tamper probabilities → document fraud score
+## Pipeline
 
-## Files
+1. **MediaPipe BlazeFace** — face detection (2ms/image, CPU)
+2. **DINOv2-small** — portrait crop → photo fake probability (1.2ms/face, GPU)
+3. **PaddleOCR PP-OCRv6** — text field detection (35ms/image, GPU)
+4. **Forensic panels** — each field crop → 224×1008 six-view composite (grayscale, ink mask, L residual, chroma, texture, edge)
+5. **ConvNeXt-Base** — panel → per-field tamper probability (1.5ms/field, GPU)
+6. **Score** — `fraud_score = max(photo_prob, max(field_probs))`
 
-| File | Purpose |
-|------|---------|
-| `Dockerfile` | GPU Docker image (CUDA 12.8, PyTorch, PaddlePaddle) |
-| `prepare_submission.py` | Entrypoint: `/data/` images → `/submissions/submission.csv` |
-| `model.py` | Model classes, forensic panel builder, text/face detection |
-| `requirements.txt` | Python dependencies |
-| `models/` | Trained weights (`.pt` files) |
+Total inference: ~2.7h for 142k documents on A100.
 
-## Model weights
-
-Before building, place weights in `models/`:
+## Repository Structure
 
 ```
-models/
-  convnextv2_base_tamper_clf.pt    # primary (335 MB, FREUID=0.0078)
-  efficientnet_b0_tamper_clf.pt    # fallback (17 MB, FREUID=0.0141)
+├── prepare_submission.py           # Docker entrypoint
+├── Dockerfile                      # GPU Docker image (CUDA 12.8)
+├── requirements.txt                # Python dependencies
+├── technical_report.pdf            # Compiled technical report
+├── LICENSE                         # MIT
+│
+├── inference/
+│   └── run_inference.py            # Full inference pipeline
+│
+├── models/
+│   ├── models.py                   # DINOv3Classifier, DINOClassifier
+│   └── weights/                    # Download from HuggingFace (see below)
+│
+├── train/
+│   ├── train_text.py               # Train ConvNeXt-B text tamper detector
+│   ├── train_face.py               # Train DINOv2-small face detector
+│   ├── precache_boxes.py           # Pre-run PaddleOCR on training images
+│   ├── train_labels.csv            # Competition training labels
+│   ├── annotations/                # Subtask + field-level annotations
+│   └── scripts/                    # Shared modules (panels, data, synth, metric)
+│
+├── technical_report/               # LaTeX source + figures
+│   ├── technical_report.tex
+│   ├── references.bib
+│   └── figures/
+│
+└── how_to_train.md                 # Complete training guide
 ```
 
-Copy from training artifacts:
+## Model Weights
+
+Download from HuggingFace:
+
 ```bash
-cp ../artifacts/convnextv2_base_tamper_clf.pt models/
-cp ../artifacts/efficientnet_b0_tamper_clf.pt models/
+pip install huggingface_hub
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('akhil838/doc-forensic-models-v1', local_dir='models/weights')
+"
 ```
 
-## Build
+| Weight | Size | Description |
+|--------|------|-------------|
+| `dinov3_convnext_base_tamper_clf.pt` | 336 MB | Text tamper scorer (ConvNeXt-B, epoch 2) |
+| `face/dinov2_small_unified_face.pt` | 85 MB | Face/photo classifier |
+| `blaze_face.tflite` | 225 KB | MediaPipe face detection |
+| `paddleocr_cache/` | 59 MB | PaddleOCR PP-OCRv6 detection model |
+
+Weights: https://huggingface.co/akhil838/doc-forensic-models-v1
+
+## Docker Build & Run
 
 ```bash
-docker build -t freuid-repro:latest .
-```
+# Build (network available — downloads PyTorch, PaddlePaddle, caches HF models)
+docker build --build-arg HF_TOKEN=hf_xxx -t freuid-repro .
 
-Build time: ~15 min (downloads PyTorch + PaddlePaddle).
-
-## Run (local test)
-
-```bash
-# Prepare flat image directory (no CSV, no subfolders)
-mkdir -p test_images
-cp /path/to/some/images/*.jpeg test_images/
-
-# Run with GPU, no network
-docker run --rm \
-  --gpus all \
-  --network none \
-  -v "$(pwd)/test_images:/data:ro" \
-  -v "$(pwd)/output:/submissions" \
+# Run (no network)
+docker run --rm --gpus all --network none \
+  -v /path/to/test/images:/data:ro \
+  -v $(pwd)/out:/submissions \
   freuid-repro:latest
 ```
 
-Output: `output/submission.csv` with columns `id,label`.
+Output: `/submissions/submission.csv` with columns `id,label`.
 
-## Run without GPU
+## Local Inference (without Docker)
 
 ```bash
-docker run --rm \
-  --network none \
-  -v "$(pwd)/test_images:/data:ro" \
-  -v "$(pwd)/output:/submissions" \
-  freuid-repro:latest --device cpu
+export HF_TOKEN=hf_your_token
+python inference/run_inference.py \
+  --image-dir /path/to/images \
+  --model-dir models/weights \
+  --output submission.csv \
+  --device cuda
 ```
 
-## Hardware requirements
+## Training
 
-- **GPU**: NVIDIA A100/T4/V100 with ≥8 GB VRAM (tested on A100-40GB)
-- **RAM**: ≥16 GB
-- **Time**: ~3–5h for 142k documents on A100
+See [how_to_train.md](how_to_train.md) for complete instructions.
 
-## External resources
+## Hardware
+
+- **Training**: Apple M3 Max (64GB RAM, MPS)
+- **Inference**: NVIDIA A100-PCIE-40GB (~2.7h for 142k docs)
+- **Also tested**: Kaggle T4 GPU
+
+## External Resources
 
 | Resource | License | Usage |
 |----------|---------|-------|
-| `facebook/dinov3-convnext-base-pretrain-lvd1689m` | Apache 2.0 | Backbone (baked into checkpoint) |
+| `facebook/dinov3-convnext-base-pretrain-lvd1689m` | Apache 2.0 | Text classifier backbone |
+| `facebook/dinov2-small` | Apache 2.0 | Face classifier backbone |
 | PaddleOCR PP-OCRv6 | Apache 2.0 | Text field detection |
 | MediaPipe BlazeFace | Apache 2.0 | Face detection |
-| ImageNet pretrained weights (via timm) | Various | EfficientNet-B0 init |
 
-## Reproducibility
+No external training data beyond the FREUID competition dataset.
 
-- **Seeds**: `SEED=42` for all random operations
-- **Determinism**: inference is deterministic given same input order
-- **Network**: `--network none` verified — no runtime downloads
-- **Weights**: all baked into Docker image via `COPY models/ /models/`
+## Contact
+
+Akhil Kosuri — kosuriakhil19@gmail.com

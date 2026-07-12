@@ -43,6 +43,7 @@
 
 \begin{document}
 \maketitle
+\sloppy
 
 \begin{abstract}
 We present a two-branch forensic pipeline for identity document fraud detection
@@ -66,10 +67,9 @@ All code, weights, and annotations are released for full reproducibility.
 
 \noindent\textbf{Competition:} The FREUID Challenge 2026 (IJCAI-ECAI 2026)\\
 \textbf{Kaggle team:} \kaggleteam\\
-\textbf{Code:} \url{https://github.com/akhil838/doc-forensic-pipeline}
-(commit \texttt{c3a7d9ff})\\
-\textbf{Weights:} \url{https://huggingface.co/akhil838/doc-forensic-models-v1} (private)\\
-
+\textbf{Code:} \url{https://github.com/akhil838/doc-forensic-pipeline}\\
+\hspace*{1.5cm}(commit \texttt{c3a7d9ff})\\
+\textbf{Weights:} \url{https://huggingface.co/akhil838/doc-forensic-models-v1}\\
 % ============================================================================
 \section{Introduction}
 \label{sec:intro}
@@ -210,12 +210,11 @@ processed into six grayscale views arranged in a $2 \times 3$ grid:
 \subsection{Text tamper classifier (ConvNeXt-Base)}
 
 The forensic panels are classified by a ConvNeXt-Base backbone initialized from
-\texttt{facebook/dinov3-convnext-base-pretrain-lvd1689m} (88M parameters).
+{\small\texttt{facebook/dinov3-convnext-base-pretrain-lvd1689m}} (88M parameters).
 The last 2 ConvNeXt stages and the layer normalization are unfrozen during
 fine-tuning; earlier stages remain frozen.
 The classification head is:
-Linear$(1024, 256)$ $\rightarrow$ GELU $\rightarrow$ Dropout$(0.15)$ $\rightarrow$
-Linear$(256, 1)$.
+Linear$(1024, 256)$ $\to$ GELU $\to$ Dropout$(0.15)$ $\to$ Linear$(256, 1)$.
 
 \subsubsection{Training data composition}
 
