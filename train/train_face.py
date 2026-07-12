@@ -31,11 +31,11 @@ from transformers import AutoModel
 SEED = 42
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
-DATA_ROOT = Path('the-freuid-challenge-2026-ijcai-ecai (1)')
-ANN_CSV = Path('subtask_annotations.csv')
-BOXES_CSV = Path('crop_boxes.csv')
-MODEL_DIR = Path('unified_face_dino_model'); MODEL_DIR.mkdir(exist_ok=True)
-PRED_ROOT = DATA_ROOT / 'public_test' / 'predictions'; PRED_ROOT.mkdir(parents=True, exist_ok=True)
+# Defaults — overridden by CLI args in main()
+DATA_ROOT = Path('.')
+ANN_CSV = Path('annotations/subtask_annotations.csv')
+BOXES_CSV = Path('annotations/crop_boxes.csv')
+MODEL_DIR = Path('models')
 
 # Standard portrait crop before model preprocessing: (width, height).
 STANDARD_PHOTO_SIZE = (256, 320)

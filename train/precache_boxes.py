@@ -1,18 +1,16 @@
 #!/usr/bin/env python
-"""Pre-run PaddleOCR over the annotation/eval image queue and cache field boxes.
+"""Pre-run PaddleOCR over training images and cache field boxes as .npy files.
 
-Fills artifacts/paddle_box_cache/<id>.npy (same cache the annotation server and the
-notebook's Block 14 read), so the annotator never waits on OCR. Resumable (skips
-already-cached ids), multi-worker, public-first ordering.
+Resumable (skips already-cached ids), multi-worker.
 
-    python precache_paddle_boxes.py                 # all text-fakes (public first), 4 workers
-    python precache_paddle_boxes.py --split public  # just public fakes
-    python precache_paddle_boxes.py --include-clean # also all clean docs (for training negatives)
-    python precache_paddle_boxes.py --workers 6
+Usage:
+    python precache_boxes.py --data-root /path/to/data --ann-dir annotations
+    python precache_boxes.py --data-root /path/to/data --ann-dir annotations --include-clean --workers 4
 """
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -21,22 +19,14 @@ import cv2
 import numpy as np
 import pandas as pd
 
-DATA_ROOT = Path("the-freuid-challenge-2026-ijcai-ecai (1)")
-TRAIN_DIR = DATA_ROOT / "train" / "train"
-PUBLIC_DIR = DATA_ROOT / "public_test" / "public_test"
-SUBTASK_CSV = Path("subtask_annotations.csv")
-PUBLIC_MANUAL_CSV = Path("public_test_manual_labels.csv")
-BOX_CACHE = Path("artifacts") / "paddle_box_cache"
-
 _OCR = None
 
 
 def _init_worker():
     global _OCR
-    import os
     os.environ.setdefault("OMP_NUM_THREADS", "3")
     from paddleocr import TextDetection
-    _OCR = TextDetection()   # detection only — we only need field boxes, not recognized text
+    _OCR = TextDetection()
 
 
 def _result_to_boxes(r) -> np.ndarray:
@@ -50,8 +40,8 @@ def _result_to_boxes(r) -> np.ndarray:
 
 
 def _task(item):
-    image_id, path = item
-    cache = BOX_CACHE / f"{image_id}.npy"
+    image_id, path, cache_dir = item
+    cache = Path(cache_dir) / f"{image_id}.npy"
     if cache.exists():
         return "cached"
     try:
@@ -64,46 +54,48 @@ def _task(item):
         r = res[0] if isinstance(res, (list, tuple)) else res
         np.save(cache, _result_to_boxes(r))
         return "ok"
-    except Exception as exc:  # cache empty so we don't spin on a bad file
+    except Exception as exc:
         np.save(cache, np.zeros((0, 4), np.float32))
         return f"err:{type(exc).__name__}"
 
 
-def build_items(split: str, include_clean: bool):
-    """Public first (eval-relevant, small), then train. Fakes first within each split."""
-    pub_rows, train_rows = [], []
-    if split in ("public", "both"):
-        pub = pd.read_csv(PUBLIC_MANUAL_CSV)
-        pub = pub[pub["text_label"].notna()].copy()
-        pub["text_label"] = pub["text_label"].astype(int)
-        pub = pub.sort_values("text_label", ascending=False)   # fakes first
-        for _, r in pub.iterrows():
-            if include_clean or int(r["text_label"]) == 1:
-                pub_rows.append((r["id"], str(PUBLIC_DIR / f"{r['id']}.jpeg")))
-    if split in ("train", "both"):
-        sub = pd.read_csv(SUBTASK_CSV).rename(columns={"details_tamper": "text_label"})
+def build_items(data_root, ann_dir, include_clean):
+    """Build list of (image_id, image_path) for training images."""
+    data_root = Path(data_root)
+    ann_dir = Path(ann_dir)
+    train_dir = data_root / "train" / "train"
+    if not train_dir.exists():
+        train_dir = data_root / "train"
+
+    rows = []
+    sub_csv = ann_dir / "subtask_annotations.csv"
+    if sub_csv.exists():
+        sub = pd.read_csv(sub_csv).rename(columns={"details_tamper": "text_label"})
         sub = sub[sub["text_label"].notna()].copy()
         sub["text_label"] = sub["text_label"].astype(int)
-        sub = sub.sort_values("text_label", ascending=False)   # fakes first
+        sub = sub.sort_values("text_label", ascending=False)  # fakes first
         for _, r in sub.iterrows():
             if include_clean or int(r["text_label"]) == 1:
-                train_rows.append((r["id"], str(TRAIN_DIR / f"{r['id']}.jpeg")))
-    items = pub_rows + train_rows
-    return [(i, p) for i, p in items if Path(p).exists()]
+                rows.append((r["id"], str(train_dir / f"{r['id']}.jpeg")))
+    return [(i, p) for i, p in rows if Path(p).exists()]
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--split", choices=["train", "public", "both"], default="both")
-    ap.add_argument("--include-clean", action="store_true")
+    ap.add_argument("--data-root", type=str, required=True, help="Competition data root (contains train_labels.csv)")
+    ap.add_argument("--ann-dir", type=str, default="annotations", help="Annotations dir (contains subtask_annotations.csv)")
+    ap.add_argument("--cache-dir", type=str, default=None, help="Output cache dir (default: ann-dir/paddle_cache)")
+    ap.add_argument("--include-clean", action="store_true", help="Also cache clean (label=0) documents")
     ap.add_argument("--workers", type=int, default=4)
     args = ap.parse_args()
 
-    BOX_CACHE.mkdir(parents=True, exist_ok=True)
-    items = build_items(args.split, args.include_clean)
-    todo = [it for it in items if not (BOX_CACHE / f"{it[0]}.npy").exists()]
-    print(f"queue={len(items)} already_cached={len(items) - len(todo)} todo={len(todo)} "
-          f"workers={args.workers}", flush=True)
+    cache_dir = Path(args.cache_dir) if args.cache_dir else Path(args.ann_dir) / "paddle_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    items = build_items(args.data_root, args.ann_dir, args.include_clean)
+    todo = [(i, p, str(cache_dir)) for i, p in items if not (cache_dir / f"{i}.npy").exists()]
+    print(f"queue={len(items)} cached={len(items)-len(todo)} todo={len(todo)} "
+          f"workers={args.workers} cache={cache_dir}", flush=True)
     if not todo:
         print("nothing to do — all cached.", flush=True)
         return
@@ -119,7 +111,7 @@ def main():
                 eta = (len(todo) - n) / max(rate, 1e-6)
                 print(f"[{n}/{len(todo)}] ok={counts['ok']} err={counts['err']} "
                       f"{rate:.1f} img/s eta={eta/60:.1f}min", flush=True)
-    print(f"done in {(time.time() - t0)/60:.1f}min | {counts} | cache dir: {BOX_CACHE}", flush=True)
+    print(f"done in {(time.time() - t0)/60:.1f}min | {counts} | cache: {cache_dir}", flush=True)
 
 
 if __name__ == "__main__":

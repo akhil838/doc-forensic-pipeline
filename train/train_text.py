@@ -81,7 +81,7 @@ def doc_field_crops(image_file, image_id, paddle_cache, top_ignore=TOP_OCR_IGNOR
     return out
 
 # ---- Build training set ----
-PANEL_CACHE_DIR = Path("artifacts/training_panels")
+PANEL_CACHE_DIR = None  # set by --output-dir in main()
 
 def _save_img(panel, folder, idx):
     """Save a forensic panel as JPEG."""
