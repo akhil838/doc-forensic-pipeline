@@ -20,3 +20,4 @@ field_predictions_*.csv
 # OS
 .DS_Store
 Thumbs.db
+technical_report/*.pdf
