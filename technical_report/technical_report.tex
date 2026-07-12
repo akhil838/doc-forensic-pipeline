@@ -115,7 +115,7 @@ Our inference pipeline processes each document image through five stages
 \begin{figure}[H]
   \centering
   % PLACEHOLDER: replace with pipeline diagram
-  \includegraphics[width=\textwidth]{figures/prediction_pipeline.png}}
+  \includegraphics[width=\textwidth]{figures/prediction_pipeline.png}
   \caption{End-to-end inference pipeline. Two branches operate independently and
            their scores are combined via max.}
   \label{fig:pipeline}
@@ -200,7 +200,7 @@ processed into six grayscale views arranged in a $2 \times 3$ grid:
 \begin{figure}[H]
   \centering
   % PLACEHOLDER: forensic panel examples
-  \includegraphics[width=\textwidth]{figures/forensic_panel_example.png}}
+  \includegraphics[width=\textwidth]{figures/forensic_panel_example.png}
   \caption{Six-view forensic panels. Top row: grayscale, ink mask, $|L|$ residual.
            Bottom row: chroma residual, texture variance, edge magnitude.
            Tampered fields show visible anomalies in residual and edge views.}
@@ -495,7 +495,7 @@ distributions while losing generalization on real document scoring.
 \begin{figure}[H]
   \centering
   % PLACEHOLDER: training curves
-  \includegraphics[width=0.9\textwidth]{figures/training_curves.png}}
+  \includegraphics[width=0.9\textwidth]{figures/training_curves.png}
   \caption{Training progression showing panel AUC vs document FREUID divergence
            after epoch~2.}
   \label{fig:training_curves}
@@ -605,7 +605,7 @@ and PaddlePaddle (PaddleOCR) were instrumental to this solution.
 \begin{figure}[H]
   \centering
   % PLACEHOLDER: per-field prediction heatmap on a document
-  \includegraphics[width=\textwidth]{figures/field_heatmap.png}}
+  \includegraphics[width=\textwidth]{figures/field_heatmap.png}
   \caption{Per-field tamper probability overlay. Left: genuine document
            (all fields score $<0.1$). Right: tampered document (one field
            scores $>0.95$, others $<0.1$).}
