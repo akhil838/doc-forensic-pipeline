@@ -44,47 +44,64 @@ def letterbox_rgb(crop_rgb: np.ndarray, out_w: int = TILE_W, out_h: int = TILE_H
 
 def forensic_panel_from_crop(crop_rgb: np.ndarray,
                               tile_w: int = TILE_W, tile_h: int = TILE_H) -> np.ndarray:
-    """Build 224×1008 six-view forensic panel from a text-field crop (RGB uint8)."""
+    """Build 224×1008 six-view forensic panel from a text-field crop (RGB uint8).
+
+    Layout (2 rows × 3 cols of 112×336 tiles):
+        Row 1: grayscale | ink mask | |L| residual
+        Row 2: chroma residual | texture variance | edge magnitude
+
+    Each view highlights a different tampering signal:
+        - Grayscale: raw text appearance, font/weight consistency
+        - Ink mask: detects reprinted text (different ink density/coverage)
+        - L residual: background-subtracted luminance reveals inserted/pasted content
+        - Chroma: color inconsistency in CIELAB space (different paper/ink color)
+        - Texture: local variance detects smooth reprinted patches vs textured originals
+        - Edge: Sobel gradient reveals halos/blurring around tampered text boundaries
+    """
+    # Letterbox to standard tile size, track valid (non-padded) pixels
     crop_rgb, valid, _ = letterbox_rgb(crop_rgb, out_w=tile_w, out_h=tile_h)
     lab = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
     gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
     L, A, B = lab[:, :, 0], lab[:, :, 1], lab[:, :, 2]
 
-    # Ink mask
+    # Ink mask: dual threshold — adaptive (dark relative to local mean) + absolute dark
+    # Catches both printed text on light backgrounds and very dark ink on any background
     local_gray = cv2.GaussianBlur(gray, (0, 0), sigmaX=5, sigmaY=5)
     ink = ((gray < local_gray - 22) & (gray < 175)) | (gray < 80)
     ink = cv2.dilate(ink.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1)
 
-    # Background-subtracted residuals
+    # Background-subtracted residuals in CIELAB space
+    # Removes slowly-varying background pattern, leaving only local anomalies
     bg_sigma = max(8, min(tile_w, tile_h) // 8)
     L_resid = L - cv2.GaussianBlur(L, (0, 0), sigmaX=bg_sigma, sigmaY=bg_sigma)
     A_resid = A - cv2.GaussianBlur(A, (0, 0), sigmaX=bg_sigma, sigmaY=bg_sigma)
     B_resid = B - cv2.GaussianBlur(B, (0, 0), sigmaX=bg_sigma, sigmaY=bg_sigma)
     chroma = np.sqrt(A_resid ** 2 + B_resid ** 2)
 
-    # Texture variance
+    # Local texture variance — smooth patches (reprinted/pasted) vs textured (original)
     mean = cv2.blur(gray, (15, 15))
     texture = np.sqrt(np.maximum(cv2.blur(gray * gray, (15, 15)) - mean * mean, 0))
 
-    # Edge magnitude
+    # Edge magnitude (Sobel) — detects halos/blurring at tamper boundaries
     sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     edge = np.sqrt(sx * sx + sy * sy)
 
+    # Assemble 6 views into 2×3 grid; grayscale pad=245 (matches doc background), others=0
     views = [
-        cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY).astype(np.uint8),
-        ink * 255,
-        _robust_uint8(np.where(valid, np.abs(L_resid), np.nan)),
-        _robust_uint8(np.where(valid, chroma, np.nan)),
-        _robust_uint8(np.where(valid, texture, np.nan)),
-        _robust_uint8(np.where(valid, edge, np.nan)),
+        cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY).astype(np.uint8),  # 1. grayscale
+        ink * 255,                                                      # 2. ink mask
+        _robust_uint8(np.where(valid, np.abs(L_resid), np.nan)),       # 3. L residual
+        _robust_uint8(np.where(valid, chroma, np.nan)),                # 4. chroma
+        _robust_uint8(np.where(valid, texture, np.nan)),               # 5. texture
+        _robust_uint8(np.where(valid, edge, np.nan)),                  # 6. edge
     ]
     for i in range(len(views)):
         views[i][~valid] = 245 if i == 0 else 0
     views_rgb = [cv2.cvtColor(v, cv2.COLOR_GRAY2RGB) for v in views]
-    top = np.concatenate(views_rgb[:3], axis=1)
-    bottom = np.concatenate(views_rgb[3:], axis=1)
-    return np.concatenate([top, bottom], axis=0)
+    top = np.concatenate(views_rgb[:3], axis=1)    # row 1: gray | ink | L_resid
+    bottom = np.concatenate(views_rgb[3:], axis=1)  # row 2: chroma | texture | edge
+    return np.concatenate([top, bottom], axis=0)     # 224 × 1008 × 3
 
 
 def real_ink_mask(crop: np.ndarray) -> np.ndarray:

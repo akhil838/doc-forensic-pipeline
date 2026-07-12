@@ -1,5 +1,21 @@
 # How to Train & Run Inference
 
+## Hardware
+
+- **Training**: Apple M3 Max (16-core, 64GB RAM, MPS backend)
+  - ConvNeXt-B: ~1.5h/epoch (6 epochs, best at epoch 2)
+  - DINOv2-small face: ~10min/epoch (8 epochs)
+  - PaddleOCR precache: ~3.5h for 20k images (4 CPU workers, no GPU on Mac)
+- **Inference benchmarked on**: NVIDIA A100-PCIE-40GB
+  - Full pipeline: ~2.7h for 142k documents
+- **Also tested on**: Kaggle T4 GPU
+
+## Known Limitations
+
+- HSV hue/saturation augmentation has no effect on grayscale forensic panels (augmentation is applied after panel generation; panels are grayscale 6-view composites)
+- PaddleOCR does not support MPS — runs on CPU only on Mac (~1.2s/image vs 35ms on A100 GPU)
+- `train_face.py` loads data at module level (notebook-derived) — requires `--data-root` pointing to valid data
+
 ## Directory Structure
 
 ```
