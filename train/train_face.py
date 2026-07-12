@@ -449,6 +449,10 @@ unified_model, unified_result = train_unified_face_model()
 # === CLI entry point ===
 def main():
     import argparse
+
+    global DATA_ROOT, ANN_CSV, MODEL_DIR, EPOCHS, BATCH_SIZE, DINO_BACKBONE_LR, DINO_HEAD_LR
+    global IMAGE_ROOT, TRAIN_DIR, CROP_BOXES, COUNTRY_TYPES
+
     ap = argparse.ArgumentParser(description="Train unified DINOv2-small face detector.")
     ap.add_argument("--data-root", type=str, default=str(DATA_ROOT),
                     help="Competition data root (contains train_labels.csv)")
@@ -462,7 +466,6 @@ def main():
     ap.add_argument("--head-lr", type=float, default=DINO_HEAD_LR)
     args = ap.parse_args()
 
-    global DATA_ROOT, ANN_CSV, MODEL_DIR, EPOCHS, BATCH_SIZE, DINO_BACKBONE_LR, DINO_HEAD_LR
     DATA_ROOT = Path(args.data_root)
     ANN_CSV = Path(args.ann_csv)
     MODEL_DIR = Path(args.output_dir); MODEL_DIR.mkdir(exist_ok=True)
@@ -472,7 +475,6 @@ def main():
     DINO_HEAD_LR = args.head_lr
 
     # Re-derive paths
-    global IMAGE_ROOT, TRAIN_DIR, PRED_ROOT, CROP_BOXES, COUNTRY_TYPES
     train_labels = pd.read_csv(DATA_ROOT / "train_labels.csv")
     IMAGE_ROOT = next(r for r in [DATA_ROOT, DATA_ROOT / "train", DATA_ROOT.parent]
                       if (r / train_labels.iloc[0]["image_path"]).exists())
