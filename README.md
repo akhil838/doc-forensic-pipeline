@@ -32,6 +32,7 @@ Total inference: ~2.7h for 142k documents on A100.
 │   └── weights/                    # Download from HuggingFace (see below)
 │
 ├── train/
+│   ├── how_to_train.md              # Complete training guide
 │   ├── train_text.py               # Train ConvNeXt-B text tamper detector
 │   ├── train_face.py               # Train DINOv2-small face detector
 │   ├── precache_boxes.py           # Pre-run PaddleOCR on training images
@@ -44,7 +45,7 @@ Total inference: ~2.7h for 142k documents on A100.
 │   ├── references.bib
 │   └── figures/
 │
-└── how_to_train.md                 # Complete training guide
+└── REPLY_TEMPLATE.txt              # Kaggle discussion reply template
 ```
 
 ## Model Weights
@@ -96,7 +97,7 @@ python inference/run_inference.py \
 
 ## Training
 
-See [how_to_train.md](how_to_train.md) for complete instructions.
+See [train/how_to_train.md](train/how_to_train.md) for complete instructions.
 
 ## Hardware
 
