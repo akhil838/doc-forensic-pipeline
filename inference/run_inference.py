@@ -406,11 +406,11 @@ def _detect_single(args_tuple):
 
 
 def _auto_paddle_workers() -> int:
-    """Auto-select paddle worker count: 1 on CUDA/MPS (GPU handles it), cpu_count on CPU-only Linux."""
+    """Auto-select paddle worker count."""
     try:
         import paddle
         if paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0:
-            return 1  # CUDA: single process, GPU does the work
+            return 2  # 2 processes share GPU — each uses ~900MB, A100 has 40GB
     except Exception:
         pass
     import platform, multiprocessing
@@ -675,8 +675,6 @@ def main():
     ap.add_argument("--no-fp16", action="store_true", help="Disable FP16 autocast")
     ap.add_argument("--steps", default="all", choices=["all", "face", "text", "text-detect", "text-score"],
                     help="Run only specific steps: face, text (detect+score), text-detect, text-score, or all")
-    ap.add_argument("--shard", type=int, default=0, help="Shard index (0-based) for parallel runs")
-    ap.add_argument("--num-shards", type=int, default=1, help="Total number of shards")
     args = ap.parse_args()
 
     # Tee stderr to log file (captures all prints + tqdm)
@@ -714,13 +712,6 @@ def main():
     total_images = len(image_rows)
     print(f"[STEP 1] Found {total_images} images in {image_dir}", file=sys.stderr)
 
-    # Shard if requested
-    if args.num_shards > 1:
-        shard_size = (total_images + args.num_shards - 1) // args.num_shards
-        start = args.shard * shard_size
-        end = min(start + shard_size, total_images)
-        image_rows = image_rows[start:end]
-        print(f"[SHARD] {args.shard+1}/{args.num_shards}: images {start}-{end} ({len(image_rows)} images)", file=sys.stderr)
 
     t_total = time.time()
     run_steps = args.steps
