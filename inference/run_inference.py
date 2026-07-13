@@ -693,7 +693,7 @@ def main():
     print(f"Device: {DEVICE}  FP16: {USE_FP16}", file=sys.stderr)
     if DEVICE == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}  "
-              f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB", file=sys.stderr)
+              f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB", file=sys.stderr)
 
     image_dir = Path(args.image_dir)
     model_dir = Path(args.model_dir)
