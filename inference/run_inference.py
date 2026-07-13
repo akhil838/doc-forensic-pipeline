@@ -272,21 +272,28 @@ def run_face_pipeline(image_rows, model_dir, batch_size=32):
     # Init MediaPipe
     mp_det, mp_mod = _init_mediapipe(model_dir)
 
-    # Detect face boxes (CPU, ~2ms/image)
+    # Detect face boxes (threaded: per-thread MediaPipe instances, no lock needed)
+    import threading
+    _local = threading.local()
     manifest_rows = []
-    for image_id, image_path in tqdm(image_rows, desc="face detect (mediapipe)"):
+    def _detect_one(args):
+        image_id, image_path = args
         bgr = cv2.imread(str(image_path))
         if bgr is None:
-            continue
+            return None
+        if not hasattr(_local, "det"):
+            _local.det, _local.mp = _init_mediapipe(model_dir)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         H, W = rgb.shape[:2]
-        box, source = detect_standard_photo_box(mp_det, mp_mod, rgb, bgr.shape)
+        box, source = detect_standard_photo_box(_local.det, _local.mp, rgb, bgr.shape)
         x0, y0, x1, y1 = box
-        manifest_rows.append({
-            'id': image_id, 'full_image_path': str(image_path),
-            'x0': x0 / W, 'y0': y0 / H, 'x1': x1 / W, 'y1': y1 / H,
-            'source': source,
-        })
+        return {"id": image_id, "full_image_path": str(image_path),
+                "x0": x0 / W, "y0": y0 / H, "x1": x1 / W, "y1": y1 / H, "source": source}
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for row in tqdm(pool.map(_detect_one, image_rows), total=len(image_rows), desc="face detect (mediapipe)"):
+            if row is not None:
+                manifest_rows.append(row)
     mp_det.close()
     manifest = pd.DataFrame(manifest_rows)
     print(f"[FACE] Sources: {manifest['source'].value_counts().to_dict()}", file=sys.stderr)
