@@ -456,29 +456,21 @@ def run_text_detection(image_rows, box_cache_dir=None, n_workers=None):
 
         t0 = time.time()
         if n_workers <= 1:
-            # Single-process with batch prediction for better GPU utilization
+            # Single-process — PaddleOCR can't batch variable-size images
             det = get_paddle()
-            PADDLE_BATCH = 8  # batch images through GPU together
-            batch = []
             for idx, (image_id, image_path) in enumerate(tqdm(todo, desc="text detect (paddle)")):
                 bgr = cv2.imread(str(image_path))
                 if bgr is None:
                     all_boxes[image_id] = np.zeros((0, 4), np.float32)
                     continue
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                batch.append((image_id, rgb, bgr.shape[:2]))
-
-                if len(batch) >= PADDLE_BATCH or idx == len(todo) - 1:
-                    images = [b[1] for b in batch]
-                    results = list(det.predict(images, batch_size=PADDLE_BATCH))
-                    for i, (bid, _, (H, W)) in enumerate(batch):
-                        raw = _result_to_boxes(results[i] if i < len(results) else {})
-                        if box_cache_dir:
-                            Path(box_cache_dir).mkdir(parents=True, exist_ok=True)
-                            np.save(Path(box_cache_dir) / f"{bid}.npy", raw)
-                        all_boxes[bid] = filter_boxes(raw, H, W)
-                    batch = []
-
+                H, W = rgb.shape[:2]
+                result = list(det.predict(rgb))
+                raw = _result_to_boxes(result[0] if result else {})
+                if box_cache_dir:
+                    Path(box_cache_dir).mkdir(parents=True, exist_ok=True)
+                    np.save(Path(box_cache_dir) / f"{image_id}.npy", raw)
+                all_boxes[image_id] = filter_boxes(raw, H, W)
                 if (idx + 1) % 500 == 0:
                     elapsed = time.time() - t0
                     rate = (idx + 1) / elapsed
