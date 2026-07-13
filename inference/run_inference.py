@@ -629,7 +629,7 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
 # ════════════════════════════════════════════════════════════════════════════
 
 def combine_and_write(image_rows, face_df, text_results, output_path):
-    face_lookup = face_df.set_index('id')['photo_prob'].to_dict()
+    face_lookup = face_df.set_index('id')['photo_prob'].to_dict() if face_df is not None else {}
     rows = []
     for image_id, _ in image_rows:
         photo_prob = face_lookup.get(image_id, 0.0)
@@ -683,7 +683,8 @@ def main():
     ap.add_argument("--agg", default="max", choices=["max", "top3", "mean"])
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
     ap.add_argument("--no-fp16", action="store_true", help="Disable FP16 autocast")
-    args = ap.parse_args()
+    ap.add_argument("--steps", default="all", choices=["all", "face", "text", "text-detect", "text-score"],
+                    help="Run only specific steps: face, text (detect+score), text-detect, text-score, or all")
 
     # Tee stderr to log file (captures all prints + tqdm)
     if args.log:
@@ -720,28 +721,55 @@ def main():
     print(f"[STEP 1] Found {len(image_rows)} images in {image_dir}", file=sys.stderr)
 
     t_total = time.time()
+    run_steps = args.steps
 
     # Step 2: face detect + classify
-    t1 = time.time()
-    face_df = run_face_pipeline(image_rows, model_dir, batch_size=args.face_batch_size)
-    t_face = time.time() - t1
-    print(f"[STEP 2] Face pipeline done in {t_face:.0f}s ({t_face/60:.1f}min)", file=sys.stderr)
+    face_df = None
+    t_face = 0
+    if run_steps in ("all", "face"):
+        t1 = time.time()
+        face_df = run_face_pipeline(image_rows, model_dir, batch_size=args.face_batch_size)
+        t_face = time.time() - t1
+        print(f"[STEP 2] Face pipeline done in {t_face:.0f}s ({t_face/60:.1f}min)", file=sys.stderr)
+        # Save intermediate face results
+        face_csv = Path(args.output).parent / "face_probs.csv"
+        face_df.to_csv(face_csv, index=False)
+        print(f"[FACE] Saved intermediate → {face_csv}", file=sys.stderr)
+    else:
+        # Try loading saved face results
+        face_csv = Path(args.output).parent / "face_probs.csv"
+        if face_csv.exists():
+            face_df = pd.read_csv(face_csv, dtype={"id": str})
+            print(f"[FACE] Loaded {len(face_df)} from {face_csv}", file=sys.stderr)
+        else:
+            print(f"[FACE] Skipped (no saved face_probs.csv found)", file=sys.stderr)
 
     # Step 3: text field detection (with caching)
-    t2 = time.time()
-    all_boxes = run_text_detection(image_rows, box_cache_dir=args.box_cache)
-    t_det = time.time() - t2
-    print(f"[STEP 3] Text detection done in {t_det:.0f}s ({t_det/60:.1f}min)", file=sys.stderr)
+    all_boxes = {}
+    t_det = 0
+    if run_steps in ("all", "text", "text-detect"):
+        t2 = time.time()
+        all_boxes = run_text_detection(image_rows, box_cache_dir=args.box_cache)
+        t_det = time.time() - t2
+        print(f"[STEP 3] Text detection done in {t_det:.0f}s ({t_det/60:.1f}min)", file=sys.stderr)
+    elif run_steps == "text-score" and args.box_cache:
+        # Load cached boxes for scoring-only mode
+        all_boxes = run_text_detection(image_rows, box_cache_dir=args.box_cache)
+        print(f"[STEP 3] Loaded boxes from cache", file=sys.stderr)
 
     # Step 4: text field scoring
-    t3 = time.time()
-    text_results = run_text_scoring(image_rows, all_boxes, model_dir,
-                                    batch_size=args.text_batch_size, agg=args.agg)
-    t_score = time.time() - t3
-    print(f"[STEP 4] Text scoring done in {t_score:.0f}s ({t_score/60:.1f}min)", file=sys.stderr)
+    text_results = {}
+    t_score = 0
+    if run_steps in ("all", "text", "text-score"):
+        t3 = time.time()
+        text_results = run_text_scoring(image_rows, all_boxes, model_dir,
+                                        batch_size=args.text_batch_size, agg=args.agg)
+        t_score = time.time() - t3
+        print(f"[STEP 4] Text scoring done in {t_score:.0f}s ({t_score/60:.1f}min)", file=sys.stderr)
 
     # Step 5+6: combine + write
-    df = combine_and_write(image_rows, face_df, text_results, args.output)
+    if face_df is not None or text_results:
+        df = combine_and_write(image_rows, face_df, text_results, args.output)
 
     elapsed = time.time() - t_total
     print(f"\n{'='*60}", file=sys.stderr)
