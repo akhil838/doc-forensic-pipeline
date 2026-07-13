@@ -32,19 +32,14 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 # Install Python via uv
 RUN uv python install 3.12
 
-# PyTorch (needs pytorch index)
+# PyTorch (cu129)
 RUN uv pip install --system --no-cache \
-    torch==2.11.0+cu128 torchvision==0.22.0+cu128 \
-    --index-url https://download.pytorch.org/whl/cu128
+    torch torchvision \
+    --index-url https://download.pytorch.org/whl/cu129
 
-# PaddlePaddle GPU (needs paddle index)
-RUN uv pip install --system --no-cache \
-    paddlepaddle-gpu==3.3.0 \
-    --index-url https://www.paddlepaddle.org.cn/packages/stable/cu129/
-
-# Fix NVIDIA libs that PaddlePaddle may overwrite
-RUN uv pip install --system --no-cache \
-    nvidia-nccl-cu12==2.28.9 nvidia-cudnn-cu12==9.19.0.56 2>/dev/null || true
+# PaddlePaddle GPU (direct wheel, --no-deps to avoid nvidia lib conflicts with torch)
+RUN pip install --no-cache-dir --no-deps \
+    https://paddle-whl.bj.bcebos.com/stable/cu129/paddlepaddle-gpu/paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl
 
 # Remaining Python deps
 COPY requirements.txt .
