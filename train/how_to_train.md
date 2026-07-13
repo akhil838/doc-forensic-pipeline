@@ -78,7 +78,9 @@ Place the competition data so that `train_labels.csv` and `train/train/` are acc
 
 ## Step 2: Pre-cache PaddleOCR Field Boxes
 
-Generate PaddleOCR text field detections for all training images. Results are cached as `.npy` files so PaddleOCR only runs once per image.
+Generate PaddleOCR text field detections for all training images. Results are cached as `.npy` files so PaddleOCR only runs once per image. The script is resumable — it skips already-cached IDs.
+
+> **WARNING**: `field_tamper_annotations.csv` references tampered fields by **index** into the filtered box list from these `.npy` files. Do NOT re-run PaddleOCR on already-annotated images — it will silently break the index mapping. Only run on new/unannotated images.
 
 ```bash
 # Text-fake images only (faster, minimum needed for training)

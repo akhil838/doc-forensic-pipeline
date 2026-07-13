@@ -51,6 +51,10 @@ def doc_field_crops(image_file, image_id, paddle_cache, top_ignore=TOP_OCR_IGNOR
                     min_aspect=0.5, max_h_frac=0.09, max_w_frac=0.85):
     """Extract text field crops from an image using cached paddle boxes.
 
+    NOTE: field_tamper_annotations.csv stores tampered field INDICES into this
+    filtered list. The indices are only valid against the original paddle_cache
+    .npy files. Do NOT re-run PaddleOCR on annotated images.
+
     Filters (must match inference):
       - top header band (top_ignore=0.17)
       - tiny boxes (w<10 or h<8)

@@ -3,6 +3,12 @@
 
 Resumable (skips already-cached ids), multi-worker.
 
+WARNING: field_tamper_annotations.csv references fields by INDEX into the
+filtered box list from these cached .npy files. Re-running PaddleOCR on
+already-annotated images will change box ordering and silently break the
+index-based annotations. Only run on NEW (unannotated) images, or back up
+the existing paddle_cache/ first.
+
 Usage:
     python precache_boxes.py --data-root /path/to/data --ann-dir annotations
     python precache_boxes.py --data-root /path/to/data --ann-dir annotations --include-clean --workers 4
