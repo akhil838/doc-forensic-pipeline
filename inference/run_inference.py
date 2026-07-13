@@ -456,37 +456,27 @@ def run_text_detection(image_rows, box_cache_dir=None, n_workers=None):
 
         t0 = time.time()
         if n_workers <= 1:
-            # Single-process with threaded image pre-loading
+            # Single-process (CUDA GPU handles parallelism internally)
             det = get_paddle()
-            from concurrent.futures import ThreadPoolExecutor
-            from collections import deque
-
-            def _preload(item):
-                image_id, image_path = item
+            for idx, (image_id, image_path) in enumerate(tqdm(todo, desc="text detect (paddle)")):
                 bgr = cv2.imread(str(image_path))
-                return image_id, image_path, bgr
-
-            with ThreadPoolExecutor(max_workers=8) as preloader:
-                for image_id, image_path, bgr in tqdm(
-                    preloader.map(_preload, todo), total=len(todo), desc="text detect (paddle)"):
-                    if bgr is None:
-                        all_boxes[image_id] = np.zeros((0, 4), np.float32)
-                        continue
-                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                    H, W = rgb.shape[:2]
-                    result = list(det.predict(rgb))
-                    raw = _result_to_boxes(result[0] if result else {})
-                    if box_cache_dir:
-                        Path(box_cache_dir).mkdir(parents=True, exist_ok=True)
-                        np.save(Path(box_cache_dir) / f"{image_id}.npy", raw)
-                    all_boxes[image_id] = filter_boxes(raw, H, W)
-                    if (len(all_boxes) - cached) % 500 == 0:
-                        elapsed = time.time() - t0
-                        done = len(all_boxes) - cached
-                        rate = done / elapsed
-                        eta = (len(todo) - done) / max(rate, 0.01)
-                        print(f"  [{done}/{len(todo)}] {rate:.1f} img/s, ETA {eta/60:.0f}min",
-                              file=sys.stderr)
+                if bgr is None:
+                    all_boxes[image_id] = np.zeros((0, 4), np.float32)
+                    continue
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                H, W = rgb.shape[:2]
+                result = list(det.predict(rgb))
+                raw = _result_to_boxes(result[0] if result else {})
+                if box_cache_dir:
+                    Path(box_cache_dir).mkdir(parents=True, exist_ok=True)
+                    np.save(Path(box_cache_dir) / f"{image_id}.npy", raw)
+                all_boxes[image_id] = filter_boxes(raw, H, W)
+                if (idx + 1) % 500 == 0:
+                    elapsed = time.time() - t0
+                    rate = (idx + 1) / elapsed
+                    eta = (len(todo) - idx - 1) / max(rate, 0.01)
+                    print(f"  [{idx+1}/{len(todo)}] {rate:.1f} img/s, ETA {eta/60:.0f}min",
+                          file=sys.stderr)
         else:
             global _PADDLE_N_WORKERS
             _PADDLE_N_WORKERS = n_workers
