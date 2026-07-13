@@ -21,3 +21,4 @@ field_predictions_*.csv
 .DS_Store
 Thumbs.db
 technical_report/*.pdf
+.venv/

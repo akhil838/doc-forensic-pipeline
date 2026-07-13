@@ -26,6 +26,7 @@ import argparse
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -398,14 +399,16 @@ def _detect_single(args_tuple):
 
 
 def _auto_paddle_workers() -> int:
-    """Auto-select paddle worker count: 1 on CUDA (GPU handles it), cpu_count on CPU."""
+    """Auto-select paddle worker count: 1 on CUDA/MPS (GPU handles it), cpu_count on CPU-only Linux."""
     try:
         import paddle
         if paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0:
             return 1  # CUDA: single process, GPU does the work
     except Exception:
         pass
-    import multiprocessing
+    import platform, multiprocessing
+    if platform.system() == "Darwin":
+        return 1  # macOS: PaddleOCR multiprocess crashes
     return max(1, multiprocessing.cpu_count())
 
 

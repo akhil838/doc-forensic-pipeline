@@ -10,7 +10,7 @@ Saves checkpoint to --output-dir (default: models/).
 """
 
 # === Original notebook cell 0 ===
-import json, os, random, threading, time
+import json, os, random, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -34,7 +34,6 @@ random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 # Defaults — overridden by CLI args in main()
 DATA_ROOT = Path('.')
 ANN_CSV = Path('annotations/subtask_annotations.csv')
-BOXES_CSV = Path('annotations/crop_boxes.csv')
 MODEL_DIR = Path('models')
 
 # Standard portrait crop before model preprocessing: (width, height).
@@ -54,61 +53,82 @@ TRAIN_CAP_PER_CLASS = None  # set an int for faster experiments; None uses all p
 DEVICE = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
 print('device:', DEVICE)
 
-# === Original notebook cell 1 ===
-# --- Data + manual labels ---
-train = pd.read_csv(DATA_ROOT / 'train_labels.csv')
-ann = pd.read_csv(ANN_CSV).set_index('id')
+# === Data loading (deferred to main() for CLI usage) ===
+# These globals are populated by main() or by notebook %run.
+face_train = None
+COUNTRY_TYPES = []
 
-image_root_candidates = [DATA_ROOT, DATA_ROOT / 'train', DATA_ROOT.parent]
-IMAGE_ROOT = next(r for r in image_root_candidates if (r / train.iloc[0]['image_path']).exists())
-TRAIN_DIR = IMAGE_ROOT / 'train'
-PUBLIC_TEST_DIR = DATA_ROOT / 'public_test' / 'public_test'
+def _load_module_data():
+    """Load data at module level — used when running as notebook, not CLI."""
+    global face_train, COUNTRY_TYPES
+    train = pd.read_csv(DATA_ROOT / 'train_labels.csv')
+    ann = pd.read_csv(ANN_CSV).set_index('id')
 
-train['full_image_path'] = train['image_path'].map(lambda p: str(IMAGE_ROOT / p))
-train['photo_label'] = train['id'].map(ann['photo_cutout'])
-face_train = train[train['photo_label'].notna()].copy()
-face_train['photo_label'] = face_train['photo_label'].astype(int)
+    image_root_candidates = [DATA_ROOT, DATA_ROOT / 'train', DATA_ROOT.parent]
+    IMAGE_ROOT = next((r for r in image_root_candidates if (r / train.iloc[0]['image_path']).exists()), DATA_ROOT)
+    train['full_image_path'] = train['image_path'].map(lambda p: str(IMAGE_ROOT / p))
+    train['photo_label'] = train['id'].map(ann['photo_cutout'])
+    face_train = train[train['photo_label'].notna()].copy()
+    face_train['photo_label'] = face_train['photo_label'].astype(int)
+    COUNTRY_TYPES = sorted(face_train['type'].unique())
+    print('train rows:', len(train), 'manual photo labels:', len(face_train))
 
-print('train rows:', len(train), 'manual photo labels:', len(face_train), 'missing:', train['photo_label'].isna().sum())
-display(pd.crosstab(face_train['type'], face_train['photo_label'], rownames=['type'], colnames=['photo_cutout']))
-display(pd.crosstab(train['label'], train['photo_label'], rownames=['document_label'], colnames=['photo_cutout'], dropna=False))
+# Only auto-load if data exists at default path (notebook mode)
+if (DATA_ROOT / 'train_labels.csv').exists():
+    _load_module_data()
 
-# Manual normalized boxes are used only as training fallback when OpenCV misses a face.
-def load_crop_boxes(path=BOXES_CSV):
-    df = pd.read_csv(path)
-    boxes = {}
-    for _, r in df.iterrows():
-        boxes.setdefault(r['type'], {})[r['crop_name']] = (float(r.x0), float(r.y0), float(r.x1), float(r.y1))
-    return boxes
+# === Face detection — MediaPipe BlazeFace (matches inference pipeline) ===
+_BLAZE_DET = None
+_BLAZE_MP = None
 
-CROP_BOXES = load_crop_boxes()
-COUNTRY_TYPES = sorted(face_train['type'].unique())
-print('country types:', COUNTRY_TYPES)
+def _init_blaze(model_dir=None):
+    """Initialize MediaPipe BlazeFace detector (lazy singleton)."""
+    global _BLAZE_DET, _BLAZE_MP
+    if _BLAZE_DET is not None:
+        return _BLAZE_DET, _BLAZE_MP
+    import mediapipe as mp
+    # Search for blaze_face.tflite
+    candidates = [
+        Path(model_dir) / "blaze_face.tflite" if model_dir else None,
+        Path(__file__).parent.parent / "models" / "weights" / "blaze_face.tflite",
+        Path("models/weights/blaze_face.tflite"),
+    ]
+    model_path = next((p for p in candidates if p and p.exists()), None)
+    if model_path is None:
+        raise FileNotFoundError("blaze_face.tflite not found — download from HuggingFace weights")
+    _BLAZE_DET = mp.tasks.vision.FaceDetector.create_from_options(
+        mp.tasks.vision.FaceDetectorOptions(
+            base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
+            min_detection_confidence=0.3))
+    _BLAZE_MP = mp
+    print(f"MediaPipe BlazeFace loaded: {model_path}")
+    return _BLAZE_DET, _BLAZE_MP
 
-# === Original notebook cell 2 ===
-# --- OpenCV face -> standard full-photo crop ---
-CASCADE_FILES = [
-    'haarcascade_frontalface_default.xml',
-    'haarcascade_frontalface_alt2.xml',
-    'haarcascade_profileface.xml',
-]
-_CASCADE_THREAD_LOCAL = threading.local()
-
-def get_face_cascades():
-    """Return thread-local CascadeClassifier instances; OpenCV cascades are not thread-safe."""
-    cascades = getattr(_CASCADE_THREAD_LOCAL, 'face_cascades', None)
-    if cascades is None:
-        cascades = []
-        for name in CASCADE_FILES:
-            path = cv2.data.haarcascades + name
-            cascade = cv2.CascadeClassifier(path)
-            if not cascade.empty():
-                cascades.append((name, cascade))
-        _CASCADE_THREAD_LOCAL.face_cascades = cascades
-    return cascades
-
-FACE_CASCADES = get_face_cascades()
-print('loaded cascades:', [n for n, _ in FACE_CASCADES])
+def detect_largest_face(img_bgr):
+    """Detect largest left-side face with MediaPipe BlazeFace."""
+    det, mp = _init_blaze()
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    H, W = img_bgr.shape[:2]
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = det.detect(mp_image)
+    if not result.detections:
+        return None
+    best = None
+    best_area = 0
+    for d in result.detections:
+        bb = d.bounding_box
+        x0, y0, w, h = bb.origin_x, bb.origin_y, bb.width, bb.height
+        area = w * h
+        if area < 0.002 * W * H or area > 0.20 * W * H:
+            continue
+        cx = x0 + w / 2
+        is_primary = cx <= 0.48 * W
+        if best is None or (is_primary and not best[5]) or (is_primary == best[5] and area > best_area):
+            best = (int(x0), int(y0), int(w), int(h), 'mediapipe_blaze', is_primary)
+            best_area = area
+    if best is None:
+        return None
+    return best[:5]
 
 PHOTO_ASPECT = STANDARD_PHOTO_SIZE[0] / STANDARD_PHOTO_SIZE[1]
 
@@ -131,41 +151,11 @@ def _clamp_aspect_box(x0, y0, x1, y1, W, H, aspect=PHOTO_ASPECT):
     x1, y1 = min(W, x1), min(H, y1)
     return int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))
 
-def detect_largest_face(img_bgr):
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    H, W = gray.shape
-    gray_eq = cv2.equalizeHist(gray)
-    min_face = max(24, min(W, H) // 14)
-    candidates = []
-    for name, cascade in get_face_cascades():
-        for scale, neighbors in [(1.05, 3), (1.08, 4), (1.12, 3)]:
-            faces = cascade.detectMultiScale(
-                gray_eq, scaleFactor=scale, minNeighbors=neighbors,
-                minSize=(min_face, min_face), flags=cv2.CASCADE_SCALE_IMAGE,
-            )
-            for x, y, w, h in faces:
-                area = w * h
-                # Reject tiny marks and document-scale false positives.
-                if area < 0.002 * W * H or area > 0.20 * W * H:
-                    continue
-                candidates.append((int(x), int(y), int(w), int(h), name, area))
-    if not candidates:
-        return None
-    # Known ID/DL portrait photos are the primary left-side face; this avoids picking
-    # secondary ghost portraits/holograms while staying country-agnostic.
-    primary = [c for c in candidates if (c[0] + c[2] / 2) <= 0.48 * W]
-    pool = primary if primary else candidates
-    return max(pool, key=lambda b: b[-1])[:5]
 
 def face_to_photo_box(face_box, image_shape, portrait_scale=2.15):
-    """Expand the raw OpenCV face square into a centered portrait frame.
-
-    Assumption: the raw detected face square is centered inside the actual portrait
-    photo.  Keep that same center, use a smaller portrait window, and expand
-    symmetrically around the raw face in both axes.
-    """
+    """Expand face detection box into a centered portrait frame."""
     H, W = image_shape[:2]
-    fx, fy, fw, fh, cascade_name = face_box
+    fx, fy, fw, fh, source = face_box
     face_side = max(fw, fh)
     face_cx = fx + fw / 2
     face_cy = fy + fh / 2
@@ -175,28 +165,13 @@ def face_to_photo_box(face_box, image_shape, portrait_scale=2.15):
     y0 = face_cy - photo_h / 2
     x1 = face_cx + photo_w / 2
     y1 = face_cy + photo_h / 2
-    return _clamp_aspect_box(x0, y0, x1, y1, W, H), f'opencv_face:{cascade_name}:centered_raw_expand'
-
-def manual_photo_box(row, image_shape):
-    country_type = row.get('type') if isinstance(row, dict) else getattr(row, 'type', None)
-    if country_type not in CROP_BOXES or 'photo' not in CROP_BOXES[country_type]:
-        return None
-    H, W = image_shape[:2]
-    x0, y0, x1, y1 = CROP_BOXES[country_type]['photo']
-    return int(x0 * W), int(y0 * H), int(x1 * W), int(y1 * H)
+    return _clamp_aspect_box(x0, y0, x1, y1, W, H), f'face:{source}'
 
 def generic_portrait_fallback_box(image_shape):
     H, W = image_shape[:2]
-    # Covers the left portrait area used by the known ID/DL layouts without needing a country router.
     return _clamp_aspect_box(0.02 * W, 0.16 * H, 0.38 * W, 0.92 * H, W, H)
 
 def regularize_photo_box(box, image_shape, target_height_frac=0.58, min_height_frac=0.42, max_height_frac=0.72, snap=16):
-    """Keep preview/training portrait boxes visually stable across countries.
-
-    The detector finds a face; the model should see a regular portrait window.  This
-    snaps the long side to a fixed-ish document fraction, preserves STANDARD_PHOTO_SIZE
-    aspect ratio, and re-clamps to image bounds.
-    """
     H, W = image_shape[:2]
     x0, y0, x1, y1 = box
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
@@ -209,26 +184,24 @@ def regularize_photo_box(box, image_shape, target_height_frac=0.58, min_height_f
     return _clamp_aspect_box(cx - target_w / 2, cy - target_h / 2,
                              cx + target_w / 2, cy + target_h / 2, W, H)
 
-def detect_standard_photo_box(img_bgr, row=None, allow_manual_fallback=True):
+def detect_standard_photo_box(img_bgr, row=None, allow_manual_fallback=False):
+    """Detect face → portrait box. Fallback to generic left-side crop (matches inference)."""
     face = detect_largest_face(img_bgr)
     if face is not None:
         return face_to_photo_box(face, img_bgr.shape)
-    if allow_manual_fallback and row is not None:
-        mbox = manual_photo_box(row, img_bgr.shape)
-        if mbox is not None:
-            return regularize_photo_box(mbox, img_bgr.shape), 'manual_crop_boxes_photo_fallback:regularized'
-    return regularize_photo_box(generic_portrait_fallback_box(img_bgr.shape), img_bgr.shape), 'generic_portrait_fallback:regularized'
+    return regularize_photo_box(generic_portrait_fallback_box(img_bgr.shape), img_bgr.shape), 'generic_portrait_fallback'
+
 def face_size_summary(face_box, image_shape):
-    """Pixel + relative size for the selected OpenCV face box."""
+    """Pixel + relative size for the detected face box."""
     if face_box is None:
         return {'face_x': np.nan, 'face_y': np.nan, 'face_w': np.nan, 'face_h': np.nan,
                 'face_area_pct': np.nan, 'face_source': 'none'}
     H, W = image_shape[:2]
-    fx, fy, fw, fh, cascade_name = face_box
+    fx, fy, fw, fh, source = face_box
     return {
         'face_x': int(fx), 'face_y': int(fy), 'face_w': int(fw), 'face_h': int(fh),
         'face_area_pct': float(100.0 * fw * fh / (W * H)),
-        'face_source': cascade_name,
+        'face_source': source,
     }
 
 
@@ -278,9 +251,9 @@ def build_or_load_face_manifest(df, path=FACE_MANIFEST, force=False, limit=None,
         print(f'saved manifest: {path} rows={len(out)} workers={workers}')
     return out
 
-face_manifest = build_or_load_face_manifest(face_train)
-display(face_manifest.groupby(['source', 'label']).size().unstack(fill_value=0))
-display(face_manifest.groupby(['type', 'label']).size().unstack(fill_value=0))
+face_manifest = None
+if face_train is not None:
+    face_manifest = build_or_load_face_manifest(face_train)
 
 # === Original notebook cell 5 ===
 # --- Transforms, dataset, balanced unified split ---
@@ -351,10 +324,10 @@ def balanced_unified_split(manifest_df, val_fraction=VAL_FRACTION, cap_per_class
     tr, va = train_test_split(bal, test_size=val_fraction, stratify=strat, random_state=SEED)
     return tr.reset_index(drop=True), va.reset_index(drop=True), n
 
-train_df, val_df, n_per_class = balanced_unified_split(face_manifest)
-print(f'balanced unified split: n/class={n_per_class} train={len(train_df)} val={len(val_df)}')
-display(pd.crosstab(train_df['type'], train_df['label']))
-display(pd.crosstab(val_df['type'], val_df['label']))
+train_df, val_df, n_per_class = None, None, None
+if face_manifest is not None:
+    train_df, val_df, n_per_class = balanced_unified_split(face_manifest)
+    print(f'balanced unified split: n/class={n_per_class} train={len(train_df)} val={len(val_df)}')
 
 # === Original notebook cell 6 ===
 # --- Model + train/eval loops ---
@@ -431,7 +404,7 @@ def train_unified_face_model(train_df=train_df, val_df=val_df):
     torch.save(best_state, MODEL_DIR / 'unified_face.pt')
     meta = {
         'task': 'photo_cutout', 'countries': COUNTRY_TYPES, 'single_model_all_countries': True,
-        'crop_source': 'opencv face expanded to full portrait; manual crop_boxes fallback for known training rows',
+        'crop_source': 'mediapipe blazeface face detection → portrait expansion; generic fallback',
         'manual_label_source': str(ANN_CSV), 'standard_photo_size': list(STANDARD_PHOTO_SIZE),
         'model_image_size': MODEL_IMAGE_SIZE, 'backbone': DINO_MODEL_NAME,
         'balanced_n_per_class': int(n_per_class), 'val_metrics': best,
@@ -443,15 +416,15 @@ def train_unified_face_model(train_df=train_df, val_df=val_df):
     print(f"saved -> {MODEL_DIR / 'unified_face.pt'} best val auc={best['auc']:.4f}")
     return model, best
 
-# Uncomment to train:
-unified_model, unified_result = train_unified_face_model()
+# Training runs via main() CLI or notebook — not at import time
+unified_model, unified_result = None, None
 
 # === CLI entry point ===
 def main():
     import argparse
 
     global DATA_ROOT, ANN_CSV, MODEL_DIR, EPOCHS, BATCH_SIZE, DINO_BACKBONE_LR, DINO_HEAD_LR
-    global IMAGE_ROOT, TRAIN_DIR, CROP_BOXES, COUNTRY_TYPES
+    global IMAGE_ROOT, TRAIN_DIR, COUNTRY_TYPES
 
     ap = argparse.ArgumentParser(description="Train unified DINOv2-small face detector.")
     ap.add_argument("--data-root", type=str, default=str(DATA_ROOT),
@@ -485,7 +458,6 @@ def main():
     train_labels["photo_label"] = train_labels["id"].map(ann["photo_cutout"])
     face_data = train_labels[train_labels["photo_label"].notna()].copy()
     face_data["photo_label"] = face_data["photo_label"].astype(int)
-    CROP_BOXES = load_crop_boxes()
     COUNTRY_TYPES = sorted(face_data["type"].unique())
 
     print(f"data_root: {DATA_ROOT}")
