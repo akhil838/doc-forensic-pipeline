@@ -685,6 +685,7 @@ def main():
     ap.add_argument("--no-fp16", action="store_true", help="Disable FP16 autocast")
     ap.add_argument("--steps", default="all", choices=["all", "face", "text", "text-detect", "text-score"],
                     help="Run only specific steps: face, text (detect+score), text-detect, text-score, or all")
+    args = ap.parse_args()
 
     # Tee stderr to log file (captures all prints + tqdm)
     if args.log:
