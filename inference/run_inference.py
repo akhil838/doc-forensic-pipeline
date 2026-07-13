@@ -410,12 +410,12 @@ def _auto_paddle_workers() -> int:
     try:
         import paddle
         if paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0:
-            return 2  # 2 processes share GPU — each uses ~900MB, A100 has 40GB
+            return 1  # GPU: single process (CUDA can't fork into child processes)
     except Exception:
         pass
     import platform, multiprocessing
     if platform.system() == "Darwin":
-        return 1  # macOS: PaddleOCR multiprocess crashes
+        return 1
     return max(1, multiprocessing.cpu_count())
 
 
