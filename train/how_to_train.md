@@ -14,7 +14,7 @@
 
 - HSV hue/saturation augmentation has no effect on grayscale forensic panels (augmentation is applied after panel generation; panels are grayscale 6-view composites)
 - PaddleOCR does not support MPS — runs on CPU only on Mac (~1.2s/image vs 35ms on A100 GPU)
-- `train_face.py` loads data at module level (notebook-derived) — requires `--data-root` pointing to valid data
+- Synthetic text generation (`synth_tamper.py`) uses macOS system fonts — won't work in Docker/Linux without installing fonts
 
 ## Directory Structure
 
@@ -28,7 +28,6 @@
 │   │   ├── subtask_annotations.csv         # Per-image photo/text labels (69k images)
 │   │   ├── field_tamper_annotations.csv    # Per-field tamper labels (7k images)
 │   │   ├── text_field_boxes.csv            # Known field box coordinates
-│   │   └── paddle_cache/                   # PaddleOCR field boxes (.npy per image)
 │   └── scripts/
 │       ├── forensic_panels.py              # 6-view forensic panel builder
 │       ├── data.py                         # Datasets, augmentations, field extraction
@@ -39,7 +38,8 @@
 │   └── run_inference.py                    # Full inference pipeline
 ├── models/
 │   ├── models.py                           # Model class definitions
-│   └── weights/                            # Trained checkpoints (from HuggingFace)
+│   ├── configs/                            # Local HF model configs (no download needed)
+│   └── weights/                            # Trained checkpoints (Git LFS)
 ├── prepare_submission.py                   # Docker entrypoint
 └── Dockerfile
 ```
@@ -47,13 +47,19 @@
 ## Prerequisites
 
 ```bash
-# HuggingFace token (required for gated models like dinov3-convnext-base)
-# Get token from https://huggingface.co/settings/tokens (read access)
-export HF_TOKEN=hf_your_token_here
+# Clone and enter the repo
+git clone https://github.com/akhil838/doc-forensic-pipeline.git
+cd doc-forensic-pipeline
+
+# Create venv
+python3 -m venv .venv && source .venv/bin/activate
 
 # GPU (A100/T4)
-pip install torch==2.11.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128
-pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+pip install paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+
+# Mac (MPS)
+pip install torch torchvision paddlepaddle
 
 # All other deps
 pip install -r requirements.txt
@@ -151,6 +157,9 @@ PAD_X, PAD_Y = 15, 5           # Context padding around crops
 
 ## Step 4: Train Face/Photo Detector (DINOv2-small)
 
+Uses MediaPipe BlazeFace for face detection (same detector as inference pipeline).
+Falls back to generic left-side portrait crop when no face detected.
+
 ```bash
 python train/train_face.py \
   --data-root /path/to/data \
@@ -197,8 +206,7 @@ python inference/run_inference.py \
 ## Step 6: Docker Submission
 
 ```bash
-# Build (network available)
-docker build -t freuid-repro:latest .
+docker build -t freuid-repro .
 
 # Run (no network)
 docker run --rm --gpus all --network none \
@@ -211,21 +219,13 @@ Output: `/submissions/submission.csv` with columns `id,label`.
 
 ## Model Weights
 
-Weights hosted on HuggingFace (private):
+Weights are in the repo via Git LFS. They download automatically with `git clone`.
 
-```bash
-# Download weights
-pip install huggingface_hub
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download('akhil838/doc-forensic-models-v1', local_dir='models/weights')
-"
-```
+Also hosted on HuggingFace: https://huggingface.co/akhil838/doc-forensic-models-v1
 
 | Weight | Size | Description |
 |--------|------|-------------|
 | `dinov3_convnext_base_tamper_clf.pt` | 336 MB | Text tamper scorer (best epoch 2) |
-| `timm_efficientnet_b0_tamper_clf.pt` | 17 MB | Fallback text scorer |
 | `face/dinov2_small_unified_face.pt` | 85 MB | Unified face/photo classifier |
 | `blaze_face.tflite` | 225 KB | MediaPipe face detection model |
 | `paddleocr_cache/` | 59 MB | PaddleOCR PP-OCRv6 detection model |
