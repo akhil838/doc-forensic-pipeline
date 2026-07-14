@@ -566,15 +566,35 @@ def preprocess_panel(panel: np.ndarray) -> torch.Tensor:
     return (t - IMAGENET_MEAN.squeeze(0)) / IMAGENET_STD.squeeze(0)
 
 
-def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'):
-    """Step 4: Pipelined panel generation (CPU threads) + GPU scoring.
+def _build_panels_for_doc(args):
+    """Worker function for ProcessPoolExecutor — builds panels for one doc."""
+    image_id, image_path, boxes = args
+    if boxes is None or len(boxes) == 0:
+        return []
+    rgb = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
+    H, W = rgb.shape[:2]
+    results = []
+    for x0, y0, x1, y1 in boxes:
+        cx0, cy0 = max(0, int(x0) - PAD_X), max(0, int(y0) - PAD_Y)
+        cx1, cy1 = min(W, int(x1) + PAD_X), min(H, int(y1) + PAD_Y)
+        crop = rgb[cy0:cy1, cx0:cx1]
+        if crop.shape[0] >= 6 and crop.shape[1] >= 6:
+            panel = forensic_panel_from_crop(crop)
+            # Preprocess to tensor-ready numpy (avoid torch in subprocess)
+            if panel.shape[:2] != (PANEL_H, PANEL_W):
+                panel = cv2.resize(panel, (PANEL_W, PANEL_H), interpolation=cv2.INTER_AREA)
+            panel_f = panel.astype(np.float32) / 255.0
+            results.append((image_id, panel_f))
+    return results
 
-    Producer threads build panels and push to a bounded queue.
-    Consumer pulls fixed-size batches and scores on GPU.
-    Memory-bounded: at most ~256 panels buffered at a time.
+
+def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'):
+    """Step 4: ProcessPool panel generation (true parallelism) + GPU scoring.
+
+    ProcessPoolExecutor bypasses GIL for CPU-bound forensic panel generation.
+    Panels stream through a queue to GPU scoring with fixed batch sizes.
     """
     import queue, threading
-    from concurrent.futures import ThreadPoolExecutor
 
     # Load model
     weights = model_dir / "dinov3_convnext_base_tamper_clf.pt"
@@ -592,64 +612,67 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     print(f"[TEXT SCORE] Loaded {weights} ({params_m:.1f}M params, "
           f"batch_size={batch_size}, FP16={USE_FP16}, compiled={DEVICE=='cuda'})", file=sys.stderr)
 
-    # --- Producer: multiple threads build panels, push (id, tensor) to queue ---
-    panel_q = queue.Queue(maxsize=1024)  # bounded: ~1024 panels in flight (~2.8GB)
-    n_docs_with_fields = sum(1 for iid, _ in image_rows
-                             if all_boxes.get(iid) is not None and len(all_boxes.get(iid, [])) > 0)
+    # Prepare work items: (image_id, image_path, boxes)
+    work_items = [(iid, str(ip), all_boxes.get(iid))
+                  for iid, ip in image_rows
+                  if all_boxes.get(iid) is not None and len(all_boxes.get(iid, [])) > 0]
+    print(f"[TEXT SCORE] Processing {len(work_items)} docs with fields "
+          f"({len(image_rows) - len(work_items)} without)", file=sys.stderr)
 
-    def _build_and_enqueue(args):
-        image_id, image_path = args
-        boxes = all_boxes.get(image_id)
-        if boxes is None or len(boxes) == 0:
-            return
-        panels = extract_panels_for_doc(image_path, boxes)
-        for p in panels:
-            panel_q.put((image_id, preprocess_panel(p)))
+    # --- Producer: ProcessPool builds panels, feeds queue ---
+    panel_q = queue.Queue(maxsize=1024)
 
     def _producer():
         n_workers = min(16, max(1, (os.cpu_count() or 4)))
-        docs = [(iid, ip) for iid, ip in image_rows
-                if all_boxes.get(iid) is not None and len(all_boxes.get(iid, [])) > 0]
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            list(pool.map(_build_and_enqueue, docs))
-        panel_q.put(None)  # sentinel
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            for doc_panels in pool.map(_build_panels_for_doc, work_items, chunksize=8):
+                for item in doc_panels:
+                    panel_q.put(item)
+        panel_q.put(None)
 
     producer = threading.Thread(target=_producer, daemon=True)
     producer.start()
 
-    # --- Consumer: pull from queue, score in fixed batches ---
-    all_predictions = {}  # image_id → [prob, ...]
+    # --- Consumer: GPU scoring with fixed batches ---
+    all_predictions = {}
     total_panels = 0
     t0 = time.time()
     batch_ids = []
-    batch_tensors = []
+    batch_arrays = []
+
+    # ImageNet normalization
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
 
     pbar = tqdm(desc="score panels", unit=" panels")
 
     def _flush_batch():
-        nonlocal batch_ids, batch_tensors, total_panels
-        if not batch_tensors:
+        nonlocal batch_ids, batch_arrays, total_panels
+        if not batch_arrays:
             return
-        x = torch.stack(batch_tensors).to(DEVICE)
+        # Normalize and convert to tensor
+        arr = np.stack(batch_arrays)  # (B, H, W, 3)
+        arr = (arr - mean) / std
+        x = torch.from_numpy(arr).permute(0, 3, 1, 2).to(DEVICE)  # (B, 3, H, W)
         with torch.no_grad(), _autocast():
             logits = model(x)
             probs = torch.sigmoid(logits).cpu().numpy().tolist()
         for doc_id, prob in zip(batch_ids, probs):
             all_predictions.setdefault(doc_id, []).append(prob)
-        total_panels += len(batch_tensors)
-        pbar.update(len(batch_tensors))
+        total_panels += len(batch_arrays)
+        pbar.update(len(batch_arrays))
         batch_ids = []
-        batch_tensors = []
+        batch_arrays = []
 
     while True:
         item = panel_q.get()
         if item is None:
             _flush_batch()
             break
-        image_id, tensor = item
+        image_id, panel_f = item
         batch_ids.append(image_id)
-        batch_tensors.append(tensor)
-        if len(batch_tensors) >= batch_size:
+        batch_arrays.append(panel_f)
+        if len(batch_arrays) >= batch_size:
             _flush_batch()
 
     pbar.close()
