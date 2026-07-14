@@ -567,12 +567,11 @@ def preprocess_panel(panel: np.ndarray) -> torch.Tensor:
 
 
 def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'):
-    """Step 4: Multi-threaded panel generation + fixed-batch GPU scoring.
+    """Step 4: Pipelined panel generation (CPU threads) + GPU scoring.
 
-    1. Thread pool builds forensic panels from all docs (CPU, parallelized)
-    2. Panels queued as (image_id, tensor) regardless of doc boundaries
-    3. GPU scores fixed-size batches continuously
-    4. Predictions grouped by image_id and aggregated at the end
+    Producer threads build panels and push to a bounded queue.
+    Consumer pulls fixed-size batches and scores on GPU.
+    Memory-bounded: at most ~256 panels buffered at a time.
     """
     import queue, threading
     from concurrent.futures import ThreadPoolExecutor
@@ -585,7 +584,6 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     model = model.to(DEVICE).eval()
     if DEVICE == "cuda":
         model = torch.compile(model, mode='reduce-overhead')
-        # Warmup with fixed batch size
         with torch.no_grad(), _autocast():
             _ = model(torch.randn(batch_size, 3, 224, 1008, device=DEVICE))
             _ = model(torch.randn(1, 3, 224, 1008, device=DEVICE))
@@ -594,70 +592,74 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     print(f"[TEXT SCORE] Loaded {weights} ({params_m:.1f}M params, "
           f"batch_size={batch_size}, FP16={USE_FP16}, compiled={DEVICE=='cuda'})", file=sys.stderr)
 
-    # --- Phase 1: Build all panels with thread pool ---
-    # Each item: (image_id, tensor) or None for docs with no fields
-    panel_list = []  # [(image_id, tensor), ...]
-    doc_field_counts = {}  # image_id → number of panels
-    total_panels = 0
-    skipped = 0
+    # --- Producer: multiple threads build panels, push (id, tensor) to queue ---
+    panel_q = queue.Queue(maxsize=256)  # bounded: ~256 panels in flight
+    n_docs_with_fields = sum(1 for iid, _ in image_rows
+                             if all_boxes.get(iid) is not None and len(all_boxes.get(iid, [])) > 0)
 
-    def _build_one(args):
+    def _build_and_enqueue(args):
         image_id, image_path = args
         boxes = all_boxes.get(image_id)
         if boxes is None or len(boxes) == 0:
-            return image_id, []
+            return
         panels = extract_panels_for_doc(image_path, boxes)
-        if not panels:
-            return image_id, []
-        tensors = [preprocess_panel(p) for p in panels]
-        return image_id, tensors
+        for p in panels:
+            panel_q.put((image_id, preprocess_panel(p)))
 
-    # Filter to docs that have boxes
-    docs_with_boxes = [(iid, ip) for iid, ip in image_rows if
-                       all_boxes.get(iid) is not None and len(all_boxes.get(iid, [])) > 0]
-    docs_without = len(image_rows) - len(docs_with_boxes)
+    def _producer():
+        n_workers = min(16, max(1, (os.cpu_count() or 4)))
+        docs = [(iid, ip) for iid, ip in image_rows
+                if all_boxes.get(iid) is not None and len(all_boxes.get(iid, [])) > 0]
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            list(pool.map(_build_and_enqueue, docs))
+        panel_q.put(None)  # sentinel
 
-    print(f"[TEXT SCORE] Building panels: {len(docs_with_boxes)} docs with fields, "
-          f"{docs_without} without", file=sys.stderr)
+    producer = threading.Thread(target=_producer, daemon=True)
+    producer.start()
 
+    # --- Consumer: pull from queue, score in fixed batches ---
+    all_predictions = {}  # image_id → [prob, ...]
+    total_panels = 0
     t0 = time.time()
-    n_workers = min(16, max(1, (os.cpu_count() or 4)))
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        for image_id, tensors in tqdm(
-            pool.map(_build_one, docs_with_boxes),
-            total=len(docs_with_boxes), desc="build panels"):
-            if tensors:
-                doc_field_counts[image_id] = len(tensors)
-                for t in tensors:
-                    panel_list.append((image_id, t))
-                total_panels += len(tensors)
-            else:
-                doc_field_counts[image_id] = 0
+    batch_ids = []
+    batch_tensors = []
 
-    t_build = time.time() - t0
-    print(f"[TEXT SCORE] Built {total_panels} panels from {len(docs_with_boxes)} docs "
-          f"in {t_build:.0f}s ({total_panels/max(t_build,1):.0f} panels/s, {n_workers} threads)",
-          file=sys.stderr)
+    pbar = tqdm(desc="score panels", unit=" panels")
 
-    # --- Phase 2: Score all panels in fixed-size GPU batches ---
-    all_predictions = {}  # image_id → [prob, prob, ...]
-    t1 = time.time()
-
-    with torch.no_grad(), _autocast():
-        for i in tqdm(range(0, len(panel_list), batch_size), desc="score panels"):
-            batch = panel_list[i:i + batch_size]
-            ids_batch = [b[0] for b in batch]
-            x = torch.stack([b[1] for b in batch]).to(DEVICE)
+    def _flush_batch():
+        nonlocal batch_ids, batch_tensors, total_panels
+        if not batch_tensors:
+            return
+        x = torch.stack(batch_tensors).to(DEVICE)
+        with torch.no_grad(), _autocast():
             logits = model(x)
             probs = torch.sigmoid(logits).cpu().numpy().tolist()
-            for doc_id, prob in zip(ids_batch, probs):
-                all_predictions.setdefault(doc_id, []).append(prob)
+        for doc_id, prob in zip(batch_ids, probs):
+            all_predictions.setdefault(doc_id, []).append(prob)
+        total_panels += len(batch_tensors)
+        pbar.update(len(batch_tensors))
+        batch_ids = []
+        batch_tensors = []
 
-    t_score = time.time() - t1
-    print(f"[TEXT SCORE] Scored {total_panels} panels in {t_score:.0f}s "
-          f"({total_panels/max(t_score,1):.0f} panels/s)", file=sys.stderr)
+    while True:
+        item = panel_q.get()
+        if item is None:
+            _flush_batch()
+            break
+        image_id, tensor = item
+        batch_ids.append(image_id)
+        batch_tensors.append(tensor)
+        if len(batch_tensors) >= batch_size:
+            _flush_batch()
 
-    # --- Phase 3: Aggregate per document ---
+    pbar.close()
+    producer.join()
+
+    elapsed = time.time() - t0
+    print(f"[TEXT SCORE] Scored {total_panels} panels in {elapsed:.0f}s "
+          f"({total_panels/max(elapsed,1):.0f} panels/s)", file=sys.stderr)
+
+    # --- Aggregate per document ---
     results = {}
     for image_id, _ in image_rows:
         doc_probs = all_predictions.get(image_id, [])
@@ -673,8 +675,7 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
             score = float(np.mean(doc_probs))
         results[image_id] = (score, len(doc_probs))
 
-    print(f"[TEXT SCORE] Done: {total_panels} panels from {len(image_rows)} docs "
-          f"(build={t_build:.0f}s, score={t_score:.0f}s)", file=sys.stderr)
+    print(f"[TEXT SCORE] Done: {total_panels} panels from {len(image_rows)} docs", file=sys.stderr)
     del model
     _empty_cache()
     return results
