@@ -616,6 +616,7 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
         boxes = _get_boxes(image_id, image_path)
         if boxes is None or len(boxes) == 0:
             return
+        cv2.setNumThreads(1)  # prevent OpenCV internal threads fighting for GIL
         bgr = cv2.imread(str(image_path))
         if bgr is None:
             return
@@ -629,7 +630,7 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
                 panel = forensic_panel_from_crop(crop)
                 if panel.shape[:2] != (PANEL_H, PANEL_W):
                     panel = cv2.resize(panel, (PANEL_W, PANEL_H), interpolation=cv2.INTER_AREA)
-                panel_q.put((image_id, panel.astype(np.float32) / 255.0))
+                panel_q.put((image_id, panel))  # uint8, 680KB vs 2.7MB float32
         del bgr, rgb
 
     def _producer():
@@ -673,7 +674,8 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
         nonlocal batch_ids, batch_arrays, total_panels
         if not batch_arrays:
             return
-        arr = np.stack(batch_arrays)
+        # Convert uint8 → float32 + normalize here (not in worker threads)
+        arr = np.stack(batch_arrays).astype(np.float32) / 255.0
         arr = (arr - mean) / std
         x = torch.from_numpy(arr).permute(0, 3, 1, 2).to(DEVICE)
         with torch.no_grad(), _autocast():
