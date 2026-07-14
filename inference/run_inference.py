@@ -606,40 +606,50 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
                     return filter_boxes(raw, bgr.shape[0], bgr.shape[1])
         return None
 
+    import queue, threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    panel_q = queue.Queue(maxsize=512)
+
+    def _build_and_enqueue(args):
+        image_id, image_path = args
+        boxes = _get_boxes(image_id, image_path)
+        if boxes is None or len(boxes) == 0:
+            return
+        cv2.setNumThreads(1)
+        bgr = cv2.imread(str(image_path))
+        if bgr is None:
+            return
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        H, W = rgb.shape[:2]
+        for x0, y0, x1, y1 in boxes:
+            cx0, cy0 = max(0, int(x0) - PAD_X), max(0, int(y0) - PAD_Y)
+            cx1, cy1 = min(W, int(x1) + PAD_X), min(H, int(y1) + PAD_Y)
+            crop = rgb[cy0:cy1, cx0:cx1]
+            if crop.shape[0] >= 6 and crop.shape[1] >= 6:
+                panel = forensic_panel_from_crop(crop)
+                if panel.shape[:2] != (PANEL_H, PANEL_W):
+                    panel = cv2.resize(panel, (PANEL_W, PANEL_H), interpolation=cv2.INTER_AREA)
+                panel_q.put((image_id, panel))
+        del bgr, rgb
+
+    def _producer():
+        with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4)) as pool:
+            list(pool.map(_build_and_enqueue, image_rows))
+        panel_q.put(None)
+
+    producer = threading.Thread(target=_producer, daemon=True)
+    producer.start()
+
+    # GPU consumer: fixed batch across docs
+    batch_arrays = []
+    batch_ids = []
+    doc_probs = {}
     results = {}
     total_panels = 0
     t0 = time.time()
-
-    import subprocess, glob
-
-    # Use /dev/shm (ramdisk) if available, else /tmp
-    panel_dir = Path("/dev/shm/freuid_panels") if Path("/dev/shm").exists() else Path("/tmp/freuid_panels")
-    if panel_dir.exists():
-        import shutil
-        shutil.rmtree(panel_dir)
-    panel_dir.mkdir(parents=True)
-
-    # Launch panel builder as separate process (own GIL = true parallelism)
-    builder_script = Path(__file__).parent / "build_panels.py"
-    builder_args = [
-        sys.executable, str(builder_script),
-        "--image-dir", str(image_dir) if image_dir else str(Path(image_rows[0][1]).parent),
-        "--box-cache", str(box_cache_dir) if box_cache_dir else "",
-        "--out", str(panel_dir),
-        "--workers", str(min(16, os.cpu_count() or 4)),
-    ]
-    print(f"[TEXT SCORE] Launching panel builder subprocess...", file=sys.stderr)
-    builder_proc = subprocess.Popen(builder_args, stdout=sys.stderr, stderr=sys.stderr)
-    print(f"[TEXT SCORE] Builder PID {builder_proc.pid}", file=sys.stderr)
-
-    # GPU scorer: poll for .npy files, score in fixed batches, delete after scoring
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
-    doc_probs = {}
-    scored_files = set()
-    batch_arrays = []
-    batch_ids = []
-
     pbar = tqdm(desc="score panels", unit=" panels")
 
     def _flush():
@@ -659,52 +669,21 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
         batch_ids.clear()
 
     while True:
-        files = sorted(glob.glob(str(panel_dir / "*.npy")))
-        new_files = [f for f in files if f not in scored_files]
-
-        if new_files:
-            for f in new_files:
-                try:
-                    panel = np.load(f, allow_pickle=False)
-                    fname = Path(f).stem
-                    image_id = fname.rsplit("_", 1)[0]
-                    batch_arrays.append(panel)
-                    batch_ids.append(image_id)
-                    scored_files.add(f)
-                    os.remove(f)
-                except Exception:
-                    continue
-                if len(batch_arrays) >= batch_size:
-                    _flush()
-        else:
-            done_file = panel_dir / "_DONE"
-            if done_file.exists():
-                # Score remaining
-                files = sorted(glob.glob(str(panel_dir / "*.npy")))
-                for f in files:
-                    try:
-                        panel = np.load(f, allow_pickle=False)
-                        fname = Path(f).stem
-                        image_id = fname.rsplit("_", 1)[0]
-                        batch_arrays.append(panel)
-                        batch_ids.append(image_id)
-                        os.remove(f)
-                    except Exception:
-                        continue
-                _flush()
-                break
-            time.sleep(0.1)
+        item = panel_q.get()
+        if item is None:
+            _flush()
+            break
+        batch_ids.append(item[0])
+        batch_arrays.append(item[1])
+        if len(batch_arrays) >= batch_size:
+            _flush()
 
     pbar.close()
-    builder_proc.wait()
+    producer.join()
 
     elapsed = time.time() - t0
     print(f"[TEXT SCORE] {total_panels} panels in {elapsed:.0f}s "
           f"({total_panels/max(elapsed,1):.0f} panels/s)", file=sys.stderr)
-
-    # Cleanup
-    import shutil
-    shutil.rmtree(panel_dir, ignore_errors=True)
 
     # Aggregate per document
     for image_id, _ in image_rows:
