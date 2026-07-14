@@ -610,50 +610,81 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     total_panels = 0
     t0 = time.time()
 
-    # Accumulate panels across docs, score in fixed batches
-    batch_tensors = []
+    import queue, threading
+    from concurrent.futures import ThreadPoolExecutor
+    panel_q = queue.Queue(maxsize=512)
+
+    def _build_and_enqueue(args):
+        image_id, image_path = args
+        boxes = _get_boxes(image_id, image_path)
+        if boxes is None or len(boxes) == 0:
+            return
+        cv2.setNumThreads(1)
+        bgr = cv2.imread(str(image_path))
+        if bgr is None:
+            return
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        H, W = rgb.shape[:2]
+        for x0, y0, x1, y1 in boxes:
+            cx0, cy0 = max(0, int(x0) - PAD_X), max(0, int(y0) - PAD_Y)
+            cx1, cy1 = min(W, int(x1) + PAD_X), min(H, int(y1) + PAD_Y)
+            crop = rgb[cy0:cy1, cx0:cx1]
+            if crop.shape[0] >= 6 and crop.shape[1] >= 6:
+                panel = forensic_panel_from_crop(crop)
+                if panel.shape[:2] != (PANEL_H, PANEL_W):
+                    panel = cv2.resize(panel, (PANEL_W, PANEL_H), interpolation=cv2.INTER_AREA)
+                panel_q.put((image_id, panel))
+        del bgr, rgb
+
+    def _producer():
+        with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4)) as pool:
+            list(pool.map(_build_and_enqueue, image_rows))
+        panel_q.put(None)
+
+    producer = threading.Thread(target=_producer, daemon=True)
+    producer.start()
+
+    # GPU consumer: fixed batch=32 across docs
+    batch_arrays = []
     batch_ids = []
+    doc_probs = {}
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
-    doc_probs = {}  # image_id → [prob, ...]
+
+    pbar = tqdm(desc="score panels", unit=" panels")
 
     def _flush():
         nonlocal total_panels
-        if not batch_tensors:
+        if not batch_arrays:
             return
-        arr = np.stack(batch_tensors).astype(np.float32) / 255.0
+        arr = np.stack(batch_arrays).astype(np.float32) / 255.0
         arr = (arr - mean) / std
         x = torch.from_numpy(arr).permute(0, 3, 1, 2).to(DEVICE)
         with torch.no_grad(), _autocast():
             probs = torch.sigmoid(model(x)).cpu().numpy().tolist()
         for doc_id, prob in zip(batch_ids, probs):
             doc_probs.setdefault(doc_id, []).append(prob)
-        total_panels += len(batch_tensors)
-        batch_tensors.clear()
+        total_panels += len(batch_arrays)
+        pbar.update(len(batch_arrays))
+        batch_arrays.clear()
         batch_ids.clear()
 
-    for idx, (image_id, image_path) in enumerate(tqdm(image_rows, desc="text score")):
-        boxes = _get_boxes(image_id, image_path)
-        if boxes is None or len(boxes) == 0:
-            continue
-        panels = extract_panels_for_doc(image_path, boxes)
-        for panel in panels:
-            if panel.shape[:2] != (PANEL_H, PANEL_W):
-                panel = cv2.resize(panel, (PANEL_W, PANEL_H), interpolation=cv2.INTER_AREA)
-            batch_tensors.append(panel)
-            batch_ids.append(image_id)
-            if len(batch_tensors) >= batch_size:
-                _flush()
+    while True:
+        item = panel_q.get()
+        if item is None:
+            _flush()
+            break
+        batch_ids.append(item[0])
+        batch_arrays.append(item[1])
+        if len(batch_arrays) >= batch_size:
+            _flush()
 
-        if (idx + 1) % 500 == 0:
-            elapsed = time.time() - t0
-            rate = (idx + 1) / elapsed
-            eta = (len(image_rows) - idx - 1) / max(rate, 0.01)
-            print(f"  [{idx+1}/{len(image_rows)}] {total_panels} panels, "
-                  f"{total_panels/elapsed:.0f} panels/s, "
-                  f"{rate:.1f} img/s, ETA {eta/60:.0f}min", file=sys.stderr)
+    pbar.close()
+    producer.join()
 
-    _flush()  # remaining panels
+    elapsed = time.time() - t0
+    print(f"[TEXT SCORE] {total_panels} panels in {elapsed:.0f}s "
+          f"({total_panels/max(elapsed,1):.0f} panels/s)", file=sys.stderr)
 
     # Aggregate per document
     for image_id, _ in image_rows:
