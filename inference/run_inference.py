@@ -593,7 +593,7 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
           f"batch_size={batch_size}, FP16={USE_FP16}, compiled={DEVICE=='cuda'})", file=sys.stderr)
 
     # --- Producer: multiple threads build panels, push (id, tensor) to queue ---
-    panel_q = queue.Queue(maxsize=256)  # bounded: ~256 panels in flight
+    panel_q = queue.Queue(maxsize=1024)  # bounded: ~1024 panels in flight (~2.8GB)
     n_docs_with_fields = sum(1 for iid, _ in image_rows
                              if all_boxes.get(iid) is not None and len(all_boxes.get(iid, [])) > 0)
 
