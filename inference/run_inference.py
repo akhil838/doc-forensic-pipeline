@@ -567,17 +567,16 @@ def preprocess_panel(panel: np.ndarray) -> torch.Tensor:
 
 
 def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3',
-                     box_cache_dir=None):
-    """Step 4: Streaming text scoring — minimal memory.
+                     box_cache_dir=None, output_path=None):
+    """Step 4: Streaming text scoring with incremental CSV output.
 
-    - Loads boxes per-doc from cache or all_boxes dict
-    - 4 threads build panels → bounded queue (128) → GPU scores fixed batches
-    - No large dicts held in memory
+    - 8 threads build panels → queue(512) → GPU scores fixed batches
+    - Boxes loaded per-doc from cache (not bulk)
+    - Scores flushed to text_scores.csv every 10k docs + freed from memory
     """
     import queue, threading
     from concurrent.futures import ThreadPoolExecutor
 
-    # Load model
     weights = model_dir / "dinov3_convnext_base_tamper_clf.pt"
     model = DINOv3Classifier()
     sd = torch.load(weights, map_location='cpu', weights_only=True)
@@ -593,21 +592,20 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     print(f"[TEXT SCORE] Loaded {weights} ({params_m:.1f}M params, "
           f"batch_size={batch_size}, FP16={USE_FP16}, compiled={DEVICE=='cuda'})", file=sys.stderr)
 
-    # --- Producer: load boxes per-doc from cache, build panels ---
-    panel_q = queue.Queue(maxsize=128)
+    panel_q = queue.Queue(maxsize=512)
     cache_dir = Path(box_cache_dir) if box_cache_dir else None
 
-    def _get_boxes_for_doc(image_id, image_path):
+    def _get_boxes(image_id, image_path):
         if all_boxes and image_id in all_boxes:
             return all_boxes[image_id]
         if cache_dir:
-            cache_file = cache_dir / f"{image_id}.npy"
-            size_file = cache_dir / f"{image_id}_size.npy"
-            if cache_file.exists():
-                raw = np.load(cache_file, allow_pickle=False)
-                if size_file.exists():
-                    sz = np.load(size_file)
-                    return filter_boxes(raw, int(sz[0]), int(sz[1]))
+            npy = cache_dir / f"{image_id}.npy"
+            sz = cache_dir / f"{image_id}_size.npy"
+            if npy.exists():
+                raw = np.load(npy, allow_pickle=False)
+                if sz.exists():
+                    s = np.load(sz)
+                    return filter_boxes(raw, int(s[0]), int(s[1]))
                 bgr = cv2.imread(str(image_path))
                 if bgr is not None:
                     return filter_boxes(raw, bgr.shape[0], bgr.shape[1])
@@ -615,7 +613,7 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
 
     def _build_and_enqueue(args):
         image_id, image_path = args
-        boxes = _get_boxes_for_doc(image_id, image_path)
+        boxes = _get_boxes(image_id, image_path)
         if boxes is None or len(boxes) == 0:
             return
         bgr = cv2.imread(str(image_path))
@@ -635,16 +633,16 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
         del bgr, rgb
 
     def _producer():
-        n_workers = min(4, max(1, (os.cpu_count() or 4)))
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as pool:
             list(pool.map(_build_and_enqueue, image_rows))
         panel_q.put(None)
 
     producer = threading.Thread(target=_producer, daemon=True)
     producer.start()
 
-    # --- Consumer: GPU scoring with fixed batches ---
-    doc_predictions = {}
+    # --- Consumer ---
+    doc_probs = {}   # image_id → [prob, ...] (live, flushed periodically)
+    results = {}     # image_id → (score, n_fields) (finalized)
     total_panels = 0
     t0 = time.time()
     batch_ids = []
@@ -653,7 +651,23 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
 
+    # Incremental CSV
+    csv_path = Path(output_path).parent / "text_scores.csv" if output_path else None
+    csv_f = None
+    if csv_path:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_f = open(csv_path, 'w')
+        csv_f.write("id,text_prob,n_fields\n")
+
     pbar = tqdm(desc="score panels", unit=" panels")
+
+    def _agg(probs_list):
+        probs_list.sort(reverse=True)
+        if agg == 'max':
+            return probs_list[0]
+        elif agg == 'top3':
+            return float(np.mean(probs_list[:min(3, len(probs_list))]))
+        return float(np.mean(probs_list))
 
     def _flush_batch():
         nonlocal batch_ids, batch_arrays, total_panels
@@ -666,12 +680,28 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
             logits = model(x)
             probs = torch.sigmoid(logits).cpu().numpy().tolist()
         for doc_id, prob in zip(batch_ids, probs):
-            doc_predictions.setdefault(doc_id, []).append(prob)
+            doc_probs.setdefault(doc_id, []).append(prob)
         total_panels += len(batch_arrays)
         pbar.update(len(batch_arrays))
         batch_ids = []
         batch_arrays = []
 
+    def _flush_to_csv():
+        """Finalize accumulated docs, write to CSV, free memory."""
+        for did in list(doc_probs.keys()):
+            if did not in results:
+                p = doc_probs.pop(did)
+                score = _agg(p)
+                results[did] = (score, len(p))
+                if csv_f:
+                    csv_f.write(f"{did},{score},{len(p)}\n")
+        if csv_f:
+            csv_f.flush()
+        elapsed = time.time() - t0
+        print(f"  [flushed {len(results)} docs, {total_panels} panels, "
+              f"{total_panels/max(elapsed,1):.0f} panels/s]", file=sys.stderr)
+
+    flush_counter = 0
     while True:
         item = panel_q.get()
         if item is None:
@@ -682,6 +712,16 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
         batch_arrays.append(panel_f)
         if len(batch_arrays) >= batch_size:
             _flush_batch()
+            flush_counter += batch_size
+            if flush_counter >= 200000:  # ~10k docs worth of panels
+                _flush_to_csv()
+                flush_counter = 0
+
+    # Final flush
+    _flush_to_csv()
+    if csv_f:
+        csv_f.close()
+        print(f"[TEXT SCORE] Incremental scores → {csv_path}", file=sys.stderr)
 
     pbar.close()
     producer.join()
@@ -690,21 +730,10 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     print(f"[TEXT SCORE] Scored {total_panels} panels in {elapsed:.0f}s "
           f"({total_panels/max(elapsed,1):.0f} panels/s)", file=sys.stderr)
 
-    # --- Aggregate per document ---
-    results = {}
+    # Fill docs with no fields
     for image_id, _ in image_rows:
-        doc_probs = doc_predictions.get(image_id, [])
-        if not doc_probs:
+        if image_id not in results:
             results[image_id] = (0.0, 0)
-            continue
-        doc_probs.sort(reverse=True)
-        if agg == 'max':
-            score = doc_probs[0]
-        elif agg == 'top3':
-            score = float(np.mean(doc_probs[:min(3, len(doc_probs))]))
-        else:
-            score = float(np.mean(doc_probs))
-        results[image_id] = (score, len(doc_probs))
 
     print(f"[TEXT SCORE] Done: {total_panels} panels from {len(image_rows)} docs", file=sys.stderr)
     del model
@@ -856,7 +885,8 @@ def main():
         t3 = time.time()
         text_results = run_text_scoring(image_rows, all_boxes, model_dir,
                                         batch_size=args.text_batch_size, agg=args.agg,
-                                        box_cache_dir=args.box_cache)
+                                        box_cache_dir=args.box_cache,
+                                        output_path=args.output)
         t_score = time.time() - t3
         print(f"[STEP 4] Text scoring done in {t_score:.0f}s ({t_score/60:.1f}min)", file=sys.stderr)
 
