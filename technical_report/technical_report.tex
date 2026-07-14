@@ -61,14 +61,14 @@ Document-level fraud scores are computed as $\max(\text{photo\_prob}, \text{text
 where text probability uses max-field aggregation.
 On the FREUID public leaderboard, our solution achieves a score of \textbf{0.294}
 (lower is better). Training was performed on an Apple M3~Max;
-inference runs in approximately 2.7 hours on an NVIDIA A100 for 142{,}818 documents.
+inference runs in approximately 6 hours on an NVIDIA A100 for 134{,}997 documents.
 All code, weights, and annotations are released for full reproducibility.
 \end{abstract}
 
 \noindent\textbf{Competition:} The FREUID Challenge 2026 (IJCAI-ECAI 2026)\\
 \textbf{Kaggle team:} \kaggleteam\\
 \textbf{Code:} \url{https://github.com/akhil838/doc-forensic-pipeline}\\
-\hspace*{1.5cm}(commit \texttt{0d51c75d})\\
+\hspace*{1.5cm}(commit \texttt{dea74aa68})\\
 \textbf{Weights:} \url{https://huggingface.co/akhil838/doc-forensic-models-v1}\\
 % ============================================================================
 \section{Introduction}
@@ -301,8 +301,6 @@ sensor noise, JPEG recompression) is applied to all synthetic panels.
 
 \begin{itemize}[noitemsep]
   \item HSV hue shift ($\pm 30$, 60\%) and saturation jitter ($0.7$--$1.3\times$).
-        \emph{Note:} forensic panels are grayscale, so this augmentation has no
-        effect in practice --- a known limitation.
   \item Brightness/contrast jitter ($\alpha \in [0.7, 1.3]$, $\beta \in [-20, 20]$, 50\%).
   \item Gaussian blur ($k \in \{3, 5\}$, 20\%).
   \item JPEG recompression ($Q \in [30, 80]$, 30\%).
@@ -422,18 +420,18 @@ docker run --rm --gpus all --network none \
 \begin{table}[H]
   \centering
   \small
-  \caption{Inference timing for 142{,}818 documents.}
+  \caption{Inference timing for 134{,}997 private test documents (A100-SXM4-40GB).}
   \label{tab:timing}
-  \begin{tabular}{lrr}
+  \begin{tabular}{lrrr}
     \toprule
-    Step & A100 GPU & Apple M3~Max \\
+    Step & Time & Rate & Notes \\
     \midrule
-    MediaPipe face detection (CPU)     & 0.08\,h & 0.02\,h \\
-    DINOv2-small face classification   & 0.05\,h & 0.03\,h \\
-    PaddleOCR text field detection     & 1.4\,h  & 2.6\,h (CPU, 4 workers) \\
-    ConvNeXt-B forensic panel scoring  & 1.2\,h  & 1.5\,h \\
+    MediaPipe face detection    & 0.06\,h &  604 img/s & 16 threads, CPU \\
+    DINOv2-small face classify  & 0.12\,h &  2.8 batch/s & batch=128, FP16 \\
+    PaddleOCR text detection    & 1.5\,h  &   24 img/s & single GPU process \\
+    ConvNeXt-B panel scoring    & 4.3\,h  &  128 panels/s & torch.compile, FP16 \\
     \midrule
-    \textbf{Total}                     & \textbf{$\sim$2.7\,h} & \textbf{$\sim$4.1\,h} \\
+    \textbf{Total}              & \textbf{$\sim$6\,h} & & 1.99M panels (15 fields/doc cap) \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -505,19 +503,20 @@ distributions while losing generalization on real document scoring.
 
 \begin{itemize}[noitemsep]
   \item \textbf{Repository:} \url{https://github.com/akhil838/doc-forensic-pipeline},
-        commit \texttt{0d51c75d}.
+        commit \texttt{dea74aa68}.
   \item \textbf{Weights:} \url{https://huggingface.co/akhil838/doc-forensic-models-v1}
         (520\,MB total: ConvNeXt-B 336\,MB, DINOv2-small 85\,MB, BlazeFace 225\,KB,
         PaddleOCR 59\,MB).
   \item \textbf{Docker:} \texttt{docker build -t freuid-repro .}
         followed by \texttt{docker run --network none --gpus all}.
-  \item \textbf{Dependencies:} Python 3.12, PyTorch 2.11+cu128, PaddlePaddle 3.3,
+  \item \textbf{Dependencies:} Python 3.12, PyTorch 2.7+cu129, PaddlePaddle 3.3,
         transformers $\geq$5.10, timm 1.0.27. Full list in \texttt{requirements.txt}.
   \item \textbf{Training hardware:} Apple M3~Max (16-core CPU, 40-core GPU,
         64\,GB unified memory). Training time: $\sim$9 hours for text model
         (6 epochs), $\sim$1.3 hours for face model (8 epochs).
-  \item \textbf{Inference hardware:} NVIDIA A100-PCIE-40GB.
-        Wall-clock: $\sim$2.7 hours for 142{,}818 documents.
+  \item \textbf{Inference hardware:} NVIDIA A100-SXM4-40GB, 16-core CPU,
+        120\,GB RAM, 130\,GB disk (Vast.ai).
+        Wall-clock: $\sim$6 hours for 134{,}997 documents (1.99M forensic panels).
   \item \textbf{Randomness:} \texttt{SEED=42} for all random operations.
         Inference is deterministic given the same input order.
   \item \textbf{Network:} Inference runs with \texttt{--network none}
@@ -592,7 +591,7 @@ and PaddlePaddle (PaddleOCR) were instrumental to this solution.
     max\_h\_frac      & 0.09 (skip tall) \\
     max\_w\_frac      & 0.85 (skip wide) \\
     PAD\_X, PAD\_Y    & 15, 5 pixels \\
-    MAX\_FIELDS       & 40 \\
+    MAX\_FIELDS       & 15 \\
     \bottomrule
   \end{tabular}
 \end{table}

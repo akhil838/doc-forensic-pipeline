@@ -2,16 +2,18 @@
 FREUID Challenge 2026 — Reproducibility Package
 ---
 
-Team name: [Kaggle team name]
-Kaggle usernames: [comma-separated]
-Final Kaggle submission: [label / date-time as shown on Kaggle]
+Team name: akhil838
+Kaggle usernames: akhil838
+Final Kaggle submission:
+  - Pick 1: submission_v5_face_text (max of face + text branches) — 2026-07-15
+  - Pick 2: submission_v5_face_only (face branch only, text on public test) — 2026-07-15
 
-Repository (this should be public git repository): [URL]
-Commit SHA: [40-char hash]
-Technical report (PDF): [URL]
+Repository (this should be public git repository): https://github.com/akhil838/doc-forensic-pipeline
+Commit SHA: dea74aa68cf42b94145717f6e03ce9e85a11f757
+Technical report (PDF): https://github.com/akhil838/doc-forensic-pipeline/blob/main/technical_report.pdf
 
 We confirm this repository at the stated commit reproduces our selected final
 submission and complies with the competition rules.
 
-Signed (team captain): [Kaggle username]
-Date (UTC): [YYYY-MM-DD]
+Signed (team captain): akhil838
+Date (UTC): 2026-07-15
