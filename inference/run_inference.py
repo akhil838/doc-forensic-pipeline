@@ -428,24 +428,45 @@ def run_text_detection(image_rows, box_cache_dir=None, n_workers=None):
     """
     print(f"[TEXT DET] Detecting fields in {len(image_rows)} images...", file=sys.stderr)
 
-    # Load from cache first
+    # Load from cache first (threaded for speed)
     all_boxes = {}
     cached, todo = 0, []
-    image_sizes = {}  # id → (H, W) for filtering cached boxes
-    for image_id, image_path in image_rows:
-        if box_cache_dir:
-            cache_file = Path(box_cache_dir) / f"{image_id}.npy"
-            if cache_file.exists():
-                raw = np.load(cache_file, allow_pickle=False)
+
+    if box_cache_dir:
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        _lock = threading.Lock()
+        cache_dir = Path(box_cache_dir)
+
+        def _load_cached(args):
+            image_id, image_path = args
+            cache_file = cache_dir / f"{image_id}.npy"
+            if not cache_file.exists():
+                return image_id, image_path, None
+            raw = np.load(cache_file, allow_pickle=False)
+            # Get image size for filtering — try size cache first, fall back to imread
+            size_file = cache_dir / f"{image_id}_size.npy"
+            if size_file.exists():
+                sz = np.load(size_file)
+                H, W = int(sz[0]), int(sz[1])
+            else:
                 bgr = cv2.imread(str(image_path))
-                if bgr is not None:
-                    H, W = bgr.shape[:2]
-                    all_boxes[image_id] = filter_boxes(raw, H, W)
+                if bgr is None:
+                    return image_id, image_path, np.zeros((0, 4), np.float32)
+                H, W = bgr.shape[:2]
+                np.save(size_file, np.array([H, W], dtype=np.int32))
+            return image_id, image_path, filter_boxes(raw, H, W)
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            for image_id, image_path, boxes in tqdm(
+                pool.map(_load_cached, image_rows), total=len(image_rows), desc="load cache"):
+                if boxes is not None:
+                    all_boxes[image_id] = boxes
+                    cached += 1
                 else:
-                    all_boxes[image_id] = np.zeros((0, 4), np.float32)
-                cached += 1
-                continue
-        todo.append((image_id, image_path))
+                    todo.append((image_id, image_path))
+    else:
+        todo = list(image_rows)
 
     if cached > 0:
         print(f"[TEXT DET] Loaded {cached} from cache, {len(todo)} to detect", file=sys.stderr)
@@ -470,6 +491,7 @@ def run_text_detection(image_rows, box_cache_dir=None, n_workers=None):
                 if box_cache_dir:
                     Path(box_cache_dir).mkdir(parents=True, exist_ok=True)
                     np.save(Path(box_cache_dir) / f"{image_id}.npy", raw)
+                    np.save(Path(box_cache_dir) / f"{image_id}_size.npy", np.array([H, W], dtype=np.int32))
                 all_boxes[image_id] = filter_boxes(raw, H, W)
                 if (idx + 1) % 500 == 0:
                     elapsed = time.time() - t0
