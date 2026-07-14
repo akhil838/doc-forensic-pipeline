@@ -634,7 +634,7 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
         del bgr, rgb
 
     def _producer():
-        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as pool:
+        with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4)) as pool:
             list(pool.map(_build_and_enqueue, image_rows))
         panel_q.put(None)
 
