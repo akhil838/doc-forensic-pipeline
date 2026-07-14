@@ -545,11 +545,14 @@ def preprocess_panel(panel: np.ndarray) -> torch.Tensor:
 
 
 def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'):
-    """Step 4: Per-doc panel extraction + scoring. Memory-efficient: panels are
-    extracted, scored, and discarded per document — never held all at once.
+    """Step 4: Cross-doc batched scoring with threaded panel prefetch.
 
-    Within each document (~20 panels), panels are batched for GPU efficiency.
+    A background thread reads images and builds forensic panels while the GPU
+    scores the previous batch. Panels are batched across documents for better
+    GPU utilization.
     """
+    import queue, threading
+
     # Load model
     weights = model_dir / "dinov3_convnext_base_tamper_clf.pt"
     model = DINOv3Classifier()
@@ -558,7 +561,6 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     model = model.to(DEVICE).eval()
     if DEVICE == "cuda":
         model = torch.compile(model, mode='max-autotune')
-        # Warmup compile with dummy input
         with torch.no_grad(), _autocast():
             _ = model(torch.randn(1, 3, 224, 1008, device=DEVICE))
         print(f"[TEXT SCORE] torch.compile warmup done", file=sys.stderr)
@@ -566,52 +568,101 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     print(f"[TEXT SCORE] Loaded {weights} ({params_m:.1f}M params, "
           f"batch_size={batch_size}, FP16={USE_FP16}, compiled={DEVICE=='cuda'})", file=sys.stderr)
 
+    # --- Producer: build panels in background thread ---
+    panel_queue = queue.Queue(maxsize=64)  # buffer up to 64 docs ahead
+
+    def _producer():
+        for image_id, image_path in image_rows:
+            boxes = all_boxes.get(image_id)
+            if boxes is None or len(boxes) == 0:
+                panel_queue.put((image_id, [], 0))
+                continue
+            panels = extract_panels_for_doc(image_path, boxes)
+            if not panels:
+                panel_queue.put((image_id, [], 0))
+                continue
+            tensors = [preprocess_panel(p) for p in panels]
+            panel_queue.put((image_id, tensors, len(panels)))
+        panel_queue.put(None)  # sentinel
+
+    producer = threading.Thread(target=_producer, daemon=True)
+    producer.start()
+
+    # --- Consumer: score on GPU with cross-doc batching ---
     results = {}
     total_panels = 0
     t0 = time.time()
 
+    # Accumulate panels across docs into GPU batches
+    pending_tensors = []
+    pending_ids = []  # (image_id, start_idx, count) per doc in current batch
+    done_count = 0
+
+    pbar = tqdm(total=len(image_rows), desc="text score")
+
     with torch.no_grad(), _autocast():
-        for idx, (image_id, image_path) in enumerate(tqdm(image_rows, desc="text score")):
-            boxes = all_boxes.get(image_id)
-            if boxes is None or len(boxes) == 0:
+        while True:
+            item = panel_queue.get()
+            if item is None:
+                # Flush remaining
+                if pending_tensors:
+                    x = torch.stack(pending_tensors).to(DEVICE)
+                    logits = model(x)
+                    all_probs = torch.sigmoid(logits).cpu().numpy().tolist()
+                    for doc_id, start, count in pending_ids:
+                        doc_probs = all_probs[start:start + count]
+                        doc_probs.sort(reverse=True)
+                        if agg == 'max':
+                            score = doc_probs[0]
+                        elif agg == 'top3':
+                            score = float(np.mean(doc_probs[:min(3, len(doc_probs))]))
+                        else:
+                            score = float(np.mean(doc_probs))
+                        results[doc_id] = (score, count)
+                    pbar.update(len([1 for _, _, c in pending_ids]))
+                break
+
+            image_id, tensors, n_panels = item
+            done_count += 1
+
+            if n_panels == 0:
                 results[image_id] = (0.0, 0)
+                pbar.update(1)
                 continue
 
-            # Extract panels for this document only
-            panels = extract_panels_for_doc(image_path, boxes)
-            if not panels:
-                results[image_id] = (0.0, 0)
-                continue
+            start = len(pending_tensors)
+            pending_tensors.extend(tensors)
+            pending_ids.append((image_id, start, n_panels))
+            total_panels += n_panels
 
-            # Preprocess + score in batches within this document
-            probs = []
-            for i in range(0, len(panels), batch_size):
-                batch_panels = panels[i:i + batch_size]
-                tensors = [preprocess_panel(p) for p in batch_panels]
-                x = torch.stack(tensors).to(DEVICE)
+            # Score when batch is full enough
+            if len(pending_tensors) >= batch_size:
+                x = torch.stack(pending_tensors).to(DEVICE)
                 logits = model(x)
-                probs.extend(torch.sigmoid(logits).cpu().numpy().tolist())
+                all_probs = torch.sigmoid(logits).cpu().numpy().tolist()
+                for doc_id, s, count in pending_ids:
+                    doc_probs = all_probs[s:s + count]
+                    doc_probs.sort(reverse=True)
+                    if agg == 'max':
+                        score = doc_probs[0]
+                    elif agg == 'top3':
+                        score = float(np.mean(doc_probs[:min(3, len(doc_probs))]))
+                    else:
+                        score = float(np.mean(doc_probs))
+                    results[doc_id] = (score, count)
+                pbar.update(len(pending_ids))
+                pending_tensors = []
+                pending_ids = []
 
-            total_panels += len(panels)
-
-            # Aggregate: max (from score_public in train_custom_model.py)
-            probs_sorted = sorted(probs, reverse=True)
-            if agg == 'max':
-                score = probs_sorted[0]
-            elif agg == 'top3':
-                k = min(3, len(probs_sorted))
-                score = float(np.mean(probs_sorted[:k]))
-            else:
-                score = float(np.mean(probs_sorted))
-            results[image_id] = (score, len(panels))
-
-            if (idx + 1) % 500 == 0:
+            if done_count % 500 == 0:
                 elapsed = time.time() - t0
-                rate = (idx + 1) / elapsed
-                eta = (len(image_rows) - idx - 1) / max(rate, 0.01)
-                print(f"  [{idx+1}/{len(image_rows)}] {total_panels} panels, "
-                      f"{rate:.1f} img/s, ETA {eta/60:.0f}min", file=sys.stderr)
+                rate = done_count / elapsed
+                eta = (len(image_rows) - done_count) / max(rate, 0.01)
+                print(f"  [{done_count}/{len(image_rows)}] {total_panels} panels, "
+                      f"{total_panels/elapsed:.0f} panels/s, ETA {eta/60:.0f}min", file=sys.stderr)
 
+    pbar.close()
+    producer.join()
     print(f"[TEXT SCORE] Done: {total_panels} panels from {len(image_rows)} docs", file=sys.stderr)
     del model
     _empty_cache()
