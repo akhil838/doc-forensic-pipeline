@@ -62,7 +62,7 @@ PHOTO_ASPECT = STANDARD_PHOTO_SIZE[0] / STANDARD_PHOTO_SIZE[1]
 TOP_OCR_IGNORE_FRAC = 0.17  # skip top 17% of image (header/title band)
 PAD_X, PAD_Y = 15, 5
 MIN_W, MIN_H = 10, 8
-MAX_FIELDS = 40
+MAX_FIELDS = 15
 
 # Panel constants
 PANEL_H, PANEL_W = 224, 1008
