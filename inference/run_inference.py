@@ -566,16 +566,92 @@ def preprocess_panel(panel: np.ndarray) -> torch.Tensor:
     return (t - IMAGENET_MEAN.squeeze(0)) / IMAGENET_STD.squeeze(0)
 
 
+def _panel_builder_process(image_rows_serializable, all_boxes_serializable,
+                            box_cache_dir, panel_q, done_event):
+    """Separate PROCESS for panel building — has its own GIL."""
+    import cv2
+    import numpy as np
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+    import sys, os
+
+    _TRAIN = str(Path(__file__).resolve().parent.parent / "train")
+    if _TRAIN not in sys.path:
+        sys.path.insert(0, _TRAIN)
+    from scripts.forensic_panels import forensic_panel_from_crop, PANEL_H, PANEL_W
+
+    TOP_OCR_IGNORE_FRAC = 0.17
+    PAD_X, PAD_Y = 15, 5
+    MIN_W, MIN_H = 10, 8
+    MAX_FIELDS = 40
+
+    def _filter_boxes(boxes, H, W, min_aspect=0.5, max_w_frac=0.85, max_h_frac=0.09):
+        kept = []
+        for x0, y0, x1, y1 in boxes:
+            bw, bh = x1 - x0, y1 - y0
+            if y0 < TOP_OCR_IGNORE_FRAC * H: continue
+            if bw < MIN_W or bh < MIN_H: continue
+            if bh > 0 and bw / bh < min_aspect: continue
+            if bw > max_w_frac * W or bh > max_h_frac * H: continue
+            kept.append([x0, y0, x1, y1])
+        return np.array(kept[:MAX_FIELDS], np.float32) if kept else np.zeros((0, 4), np.float32)
+
+    cache_dir = Path(box_cache_dir) if box_cache_dir else None
+    all_boxes = all_boxes_serializable or {}
+
+    def _get_boxes(image_id, image_path):
+        if image_id in all_boxes:
+            return all_boxes[image_id]
+        if cache_dir:
+            npy = cache_dir / f"{image_id}.npy"
+            sz_f = cache_dir / f"{image_id}_size.npy"
+            if npy.exists():
+                raw = np.load(npy, allow_pickle=False)
+                if sz_f.exists():
+                    s = np.load(sz_f)
+                    return _filter_boxes(raw, int(s[0]), int(s[1]))
+                bgr = cv2.imread(str(image_path))
+                if bgr is not None:
+                    return _filter_boxes(raw, bgr.shape[0], bgr.shape[1])
+        return None
+
+    def _build_one(args):
+        image_id, image_path = args
+        boxes = _get_boxes(image_id, image_path)
+        if boxes is None or len(boxes) == 0:
+            return
+        cv2.setNumThreads(1)
+        bgr = cv2.imread(str(image_path))
+        if bgr is None:
+            return
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        H, W = rgb.shape[:2]
+        for x0, y0, x1, y1 in boxes:
+            cx0, cy0 = max(0, int(x0) - PAD_X), max(0, int(y0) - PAD_Y)
+            cx1, cy1 = min(W, int(x1) + PAD_X), min(H, int(y1) + PAD_Y)
+            crop = rgb[cy0:cy1, cx0:cx1]
+            if crop.shape[0] >= 6 and crop.shape[1] >= 6:
+                panel = forensic_panel_from_crop(crop)
+                if panel.shape[:2] != (PANEL_H, PANEL_W):
+                    panel = cv2.resize(panel, (PANEL_W, PANEL_H), interpolation=cv2.INTER_AREA)
+                panel_q.put((image_id, panel))  # uint8 via mp.Queue (shared memory)
+        del bgr, rgb
+
+    n_workers = min(16, os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        list(pool.map(_build_one, image_rows_serializable))
+    panel_q.put(None)  # sentinel
+    done_event.set()
+
+
 def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3',
                      box_cache_dir=None, output_path=None):
-    """Step 4: Streaming text scoring with incremental CSV output.
+    """Step 4: Two-process pipeline — separate GILs for CPU and GPU.
 
-    - 8 threads build panels → queue(512) → GPU scores fixed batches
-    - Boxes loaded per-doc from cache (not bulk)
-    - Scores flushed to text_scores.csv every 10k docs + freed from memory
+    Process 1 (child): 16 threads build panels → multiprocessing.Queue
+    Process 2 (main):  GPU scores fixed batches from queue → CSV
     """
-    import queue, threading
-    from concurrent.futures import ThreadPoolExecutor
+    import multiprocessing as mp
 
     weights = model_dir / "dinov3_convnext_base_tamper_clf.pt"
     model = DINOv3Classifier()
@@ -592,58 +668,22 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     print(f"[TEXT SCORE] Loaded {weights} ({params_m:.1f}M params, "
           f"batch_size={batch_size}, FP16={USE_FP16}, compiled={DEVICE=='cuda'})", file=sys.stderr)
 
-    panel_q = queue.Queue(maxsize=512)
-    cache_dir = Path(box_cache_dir) if box_cache_dir else None
+    # Launch panel builder in separate process
+    panel_q = mp.Queue(maxsize=512)
+    done_event = mp.Event()
+    image_rows_ser = [(iid, str(ip)) for iid, ip in image_rows]
+    # Don't pass large all_boxes through pickle — let child read from cache
+    all_boxes_ser = None if box_cache_dir else dict(all_boxes) if all_boxes else None
 
-    def _get_boxes(image_id, image_path):
-        if all_boxes and image_id in all_boxes:
-            return all_boxes[image_id]
-        if cache_dir:
-            npy = cache_dir / f"{image_id}.npy"
-            sz = cache_dir / f"{image_id}_size.npy"
-            if npy.exists():
-                raw = np.load(npy, allow_pickle=False)
-                if sz.exists():
-                    s = np.load(sz)
-                    return filter_boxes(raw, int(s[0]), int(s[1]))
-                bgr = cv2.imread(str(image_path))
-                if bgr is not None:
-                    return filter_boxes(raw, bgr.shape[0], bgr.shape[1])
-        return None
+    builder = mp.Process(target=_panel_builder_process,
+                         args=(image_rows_ser, all_boxes_ser, box_cache_dir, panel_q, done_event),
+                         daemon=True)
+    builder.start()
+    print(f"[TEXT SCORE] Panel builder started (PID {builder.pid})", file=sys.stderr)
 
-    def _build_and_enqueue(args):
-        image_id, image_path = args
-        boxes = _get_boxes(image_id, image_path)
-        if boxes is None or len(boxes) == 0:
-            return
-        cv2.setNumThreads(1)  # prevent OpenCV internal threads fighting for GIL
-        bgr = cv2.imread(str(image_path))
-        if bgr is None:
-            return
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        H, W = rgb.shape[:2]
-        for x0, y0, x1, y1 in boxes:
-            cx0, cy0 = max(0, int(x0) - PAD_X), max(0, int(y0) - PAD_Y)
-            cx1, cy1 = min(W, int(x1) + PAD_X), min(H, int(y1) + PAD_Y)
-            crop = rgb[cy0:cy1, cx0:cx1]
-            if crop.shape[0] >= 6 and crop.shape[1] >= 6:
-                panel = forensic_panel_from_crop(crop)
-                if panel.shape[:2] != (PANEL_H, PANEL_W):
-                    panel = cv2.resize(panel, (PANEL_W, PANEL_H), interpolation=cv2.INTER_AREA)
-                panel_q.put((image_id, panel))  # uint8, 680KB vs 2.7MB float32
-        del bgr, rgb
-
-    def _producer():
-        with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4)) as pool:
-            list(pool.map(_build_and_enqueue, image_rows))
-        panel_q.put(None)
-
-    producer = threading.Thread(target=_producer, daemon=True)
-    producer.start()
-
-    # --- Consumer ---
-    doc_probs = {}   # image_id → [prob, ...] (live, flushed periodically)
-    results = {}     # image_id → (score, n_fields) (finalized)
+    # --- Main process: GPU scoring ---
+    doc_probs = {}
+    results = {}
     total_panels = 0
     t0 = time.time()
     batch_ids = []
@@ -652,7 +692,6 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
 
-    # Incremental CSV
     csv_path = Path(output_path).parent / "text_scores.csv" if output_path else None
     csv_f = None
     if csv_path:
@@ -662,7 +701,7 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
 
     pbar = tqdm(desc="score panels", unit=" panels")
 
-    def _agg(probs_list):
+    def _agg_fn(probs_list):
         probs_list.sort(reverse=True)
         if agg == 'max':
             return probs_list[0]
@@ -674,7 +713,6 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
         nonlocal batch_ids, batch_arrays, total_panels
         if not batch_arrays:
             return
-        # Convert uint8 → float32 + normalize here (not in worker threads)
         arr = np.stack(batch_arrays).astype(np.float32) / 255.0
         arr = (arr - mean) / std
         x = torch.from_numpy(arr).permute(0, 3, 1, 2).to(DEVICE)
@@ -689,11 +727,10 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
         batch_arrays = []
 
     def _flush_to_csv():
-        """Finalize accumulated docs, write to CSV, free memory."""
         for did in list(doc_probs.keys()):
             if did not in results:
                 p = doc_probs.pop(did)
-                score = _agg(p)
+                score = _agg_fn(p)
                 results[did] = (score, len(p))
                 if csv_f:
                     csv_f.write(f"{did},{score},{len(p)}\n")
@@ -705,34 +742,37 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
 
     flush_counter = 0
     while True:
-        item = panel_q.get()
+        try:
+            item = panel_q.get(timeout=5)
+        except Exception:
+            if done_event.is_set():
+                break
+            continue
         if item is None:
             _flush_batch()
             break
-        image_id, panel_f = item
+        image_id, panel = item
         batch_ids.append(image_id)
-        batch_arrays.append(panel_f)
+        batch_arrays.append(panel)
         if len(batch_arrays) >= batch_size:
             _flush_batch()
             flush_counter += batch_size
-            if flush_counter >= 200000:  # ~10k docs worth of panels
+            if flush_counter >= 200000:
                 _flush_to_csv()
                 flush_counter = 0
 
-    # Final flush
     _flush_to_csv()
     if csv_f:
         csv_f.close()
         print(f"[TEXT SCORE] Incremental scores → {csv_path}", file=sys.stderr)
 
     pbar.close()
-    producer.join()
+    builder.join(timeout=10)
 
     elapsed = time.time() - t0
     print(f"[TEXT SCORE] Scored {total_panels} panels in {elapsed:.0f}s "
           f"({total_panels/max(elapsed,1):.0f} panels/s)", file=sys.stderr)
 
-    # Fill docs with no fields
     for image_id, _ in image_rows:
         if image_id not in results:
             results[image_id] = (0.0, 0)
