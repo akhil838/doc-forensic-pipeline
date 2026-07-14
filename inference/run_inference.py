@@ -556,9 +556,15 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     sd = torch.load(weights, map_location='cpu', weights_only=True)
     model.load_state_dict(sd, strict=False)
     model = model.to(DEVICE).eval()
+    if DEVICE == "cuda":
+        model = torch.compile(model, mode='max-autotune')
+        # Warmup compile with dummy input
+        with torch.no_grad(), _autocast():
+            _ = model(torch.randn(1, 3, 224, 1008, device=DEVICE))
+        print(f"[TEXT SCORE] torch.compile warmup done", file=sys.stderr)
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"[TEXT SCORE] Loaded {weights} ({params_m:.1f}M params, "
-          f"batch_size={batch_size}, FP16={USE_FP16})", file=sys.stderr)
+          f"batch_size={batch_size}, FP16={USE_FP16}, compiled={DEVICE=='cuda'})", file=sys.stderr)
 
     results = {}
     total_panels = 0
