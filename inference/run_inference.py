@@ -619,15 +619,30 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     print(f"[TEXT SCORE] Processing {len(work_items)} docs with fields "
           f"({len(image_rows) - len(work_items)} without)", file=sys.stderr)
 
-    # --- Producer: ProcessPool builds panels, feeds queue ---
+    # --- Producer: ThreadPool builds panels, feeds queue ---
     panel_q = queue.Queue(maxsize=1024)
+
+    def _build_and_enqueue(args):
+        image_id, image_path, boxes = args
+        if boxes is None or len(boxes) == 0:
+            return
+        rgb = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
+        H, W = rgb.shape[:2]
+        for x0, y0, x1, y1 in boxes:
+            cx0, cy0 = max(0, int(x0) - PAD_X), max(0, int(y0) - PAD_Y)
+            cx1, cy1 = min(W, int(x1) + PAD_X), min(H, int(y1) + PAD_Y)
+            crop = rgb[cy0:cy1, cx0:cx1]
+            if crop.shape[0] >= 6 and crop.shape[1] >= 6:
+                panel = forensic_panel_from_crop(crop)
+                if panel.shape[:2] != (PANEL_H, PANEL_W):
+                    panel = cv2.resize(panel, (PANEL_W, PANEL_H), interpolation=cv2.INTER_AREA)
+                panel_q.put((image_id, panel.astype(np.float32) / 255.0))
 
     def _producer():
         n_workers = min(16, max(1, (os.cpu_count() or 4)))
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            for doc_panels in pool.map(_build_panels_for_doc, work_items, chunksize=8):
-                for item in doc_panels:
-                    panel_q.put(item)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            list(pool.map(_build_and_enqueue, work_items, chunksize=8))
         panel_q.put(None)
 
     producer = threading.Thread(target=_producer, daemon=True)
