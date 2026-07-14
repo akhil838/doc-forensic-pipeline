@@ -566,118 +566,13 @@ def preprocess_panel(panel: np.ndarray) -> torch.Tensor:
     return (t - IMAGENET_MEAN.squeeze(0)) / IMAGENET_STD.squeeze(0)
 
 
-def _shm_panel_producer(shm_name, id_shm_name, write_idx, read_idx, done_flag,
-                         image_rows, box_cache_dir, all_boxes_dict):
-    """Separate PROCESS: 16 threads build panels → shared memory ring buffer."""
-    import cv2, numpy as np, os, sys, time
-    from concurrent.futures import ThreadPoolExecutor
-    from pathlib import Path
-    import multiprocessing as mp
-
-    _TRAIN = str(Path(__file__).resolve().parent.parent / "train")
-    if _TRAIN not in sys.path:
-        sys.path.insert(0, _TRAIN)
-    from scripts.forensic_panels import forensic_panel_from_crop
-
-    RING_SIZE = 512
-    PANEL_H, PANEL_W = 224, 1008
-    PANEL_BYTES = PANEL_H * PANEL_W * 3
-    ID_LEN = 36
-    TOP_OCR_IGNORE_FRAC = 0.17
-    PAD_X, PAD_Y = 15, 5
-    MIN_W, MIN_H = 10, 8
-    MAX_FIELDS = 40
-
-    shm = __import__('multiprocessing.shared_memory', fromlist=['SharedMemory']).SharedMemory(name=shm_name)
-    id_shm = __import__('multiprocessing.shared_memory', fromlist=['SharedMemory']).SharedMemory(name=id_shm_name)
-    ring = np.ndarray((RING_SIZE, PANEL_H, PANEL_W, 3), dtype=np.uint8, buffer=shm.buf)
-    id_arr = np.ndarray((RING_SIZE, ID_LEN), dtype='S1', buffer=id_shm.buf)
-
-    cache_dir = Path(box_cache_dir) if box_cache_dir else None
-    counter = mp.Value('i', 0)
-
-    def _filter(boxes, H, W):
-        kept = []
-        for x0, y0, x1, y1 in boxes:
-            bw, bh = x1 - x0, y1 - y0
-            if y0 < TOP_OCR_IGNORE_FRAC * H: continue
-            if bw < MIN_W or bh < MIN_H: continue
-            if bh > 0 and bw / bh < 0.5: continue
-            if bw > 0.85 * W or bh > 0.09 * H: continue
-            kept.append([x0, y0, x1, y1])
-        return np.array(kept[:MAX_FIELDS], np.float32) if kept else np.zeros((0, 4), np.float32)
-
-    def _get_boxes(image_id, image_path):
-        if all_boxes_dict and image_id in all_boxes_dict:
-            return all_boxes_dict[image_id]
-        if cache_dir:
-            npy = cache_dir / f"{image_id}.npy"
-            sz_f = cache_dir / f"{image_id}_size.npy"
-            if npy.exists():
-                raw = np.load(npy, allow_pickle=False)
-                if sz_f.exists():
-                    s = np.load(sz_f)
-                    return _filter(raw, int(s[0]), int(s[1]))
-                bgr = cv2.imread(str(image_path))
-                if bgr is not None:
-                    return _filter(raw, bgr.shape[0], bgr.shape[1])
-        return None
-
-    def _build_one(args):
-        image_id, image_path = args
-        boxes = _get_boxes(image_id, image_path)
-        if boxes is None or len(boxes) == 0:
-            return
-        cv2.setNumThreads(1)
-        bgr = cv2.imread(str(image_path))
-        if bgr is None:
-            return
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        H, W = rgb.shape[:2]
-        for x0, y0, x1, y1 in boxes:
-            cx0, cy0 = max(0, int(x0) - PAD_X), max(0, int(y0) - PAD_Y)
-            cx1, cy1 = min(W, int(x1) + PAD_X), min(H, int(y1) + PAD_Y)
-            crop = rgb[cy0:cy1, cx0:cx1]
-            if crop.shape[0] >= 6 and crop.shape[1] >= 6:
-                panel = forensic_panel_from_crop(crop)
-                if panel.shape[:2] != (PANEL_H, PANEL_W):
-                    panel = cv2.resize(panel, (PANEL_W, PANEL_H), interpolation=cv2.INTER_AREA)
-                with counter.get_lock():
-                    idx = counter.value
-                    counter.value += 1
-                slot = idx % RING_SIZE
-                while (idx - read_idx.value) >= RING_SIZE:
-                    time.sleep(0.00001)
-                ring[slot] = panel
-                iid_bytes = image_id.encode('ascii')[:ID_LEN]
-                id_arr[slot, :len(iid_bytes)] = [bytes([b]) for b in iid_bytes]
-                id_arr[slot, len(iid_bytes):] = b'\x00'
-                write_idx.value = idx + 1
-        del bgr, rgb
-
-    n_workers = min(16, os.cpu_count() or 4)
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        list(pool.map(_build_one, image_rows))
-    done_flag.value = 1
-    shm.close()
-    id_shm.close()
-
-
 def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3',
                      box_cache_dir=None, output_path=None):
-    """Step 4: Two-process pipeline with shared memory ring buffer.
+    """Step 4: Per-doc panel extraction + scoring.
 
-    Process 1 (child): 16 threads build panels → shared memory (own GIL)
-    Process 2 (main): GPU scores fixed batches from shared memory → CSV
-    Zero-copy transfer: ~0.03ms/panel overhead vs ~3ms for mp.Queue pickle.
+    Simple sequential loop — panels built and scored per document.
+    torch.compile + FP16 for GPU speed.
     """
-    import multiprocessing as mp
-    from multiprocessing import shared_memory
-
-    RING_SIZE = 512
-    ID_LEN = 36
-    PANEL_BYTES = PANEL_H * PANEL_W * 3
-
     weights = model_dir / "dinov3_convnext_base_tamper_clf.pt"
     model = DINOv3Classifier()
     sd = torch.load(weights, map_location='cpu', weights_only=True)
@@ -686,131 +581,78 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     if DEVICE == "cuda":
         model = torch.compile(model, mode='reduce-overhead')
         with torch.no_grad(), _autocast():
-            _ = model(torch.randn(batch_size, 3, 224, 1008, device=DEVICE))
-            _ = model(torch.randn(1, 3, 224, 1008, device=DEVICE))
-        print(f"[TEXT SCORE] torch.compile warmup done (bs={batch_size})", file=sys.stderr)
+            for bs in [1, batch_size]:
+                _ = model(torch.randn(bs, 3, 224, 1008, device=DEVICE))
+        print(f"[TEXT SCORE] torch.compile warmup done", file=sys.stderr)
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"[TEXT SCORE] Loaded {weights} ({params_m:.1f}M params, "
-          f"batch_size={batch_size}, FP16={USE_FP16}, compiled={DEVICE=='cuda'})", file=sys.stderr)
+          f"batch_size={batch_size}, FP16={USE_FP16})", file=sys.stderr)
 
-    # Shared memory ring buffer
-    shm = shared_memory.SharedMemory(create=True, size=RING_SIZE * PANEL_BYTES)
-    id_shm = shared_memory.SharedMemory(create=True, size=RING_SIZE * ID_LEN)
-    ring = np.ndarray((RING_SIZE, PANEL_H, PANEL_W, 3), dtype=np.uint8, buffer=shm.buf)
-    id_arr = np.ndarray((RING_SIZE, ID_LEN), dtype='S1', buffer=id_shm.buf)
-    write_idx = mp.Value('i', 0)
-    read_idx = mp.Value('i', 0)
-    done_flag = mp.Value('i', 0)
+    cache_dir = Path(box_cache_dir) if box_cache_dir else None
 
-    # Launch producer in separate process
-    image_rows_ser = [(iid, str(ip)) for iid, ip in image_rows]
-    all_boxes_ser = None if box_cache_dir else (dict(all_boxes) if all_boxes else None)
+    def _get_boxes(image_id, image_path):
+        if all_boxes and image_id in all_boxes:
+            return all_boxes[image_id]
+        if cache_dir:
+            npy = cache_dir / f"{image_id}.npy"
+            sz = cache_dir / f"{image_id}_size.npy"
+            if npy.exists():
+                raw = np.load(npy, allow_pickle=False)
+                if sz.exists():
+                    s = np.load(sz)
+                    return filter_boxes(raw, int(s[0]), int(s[1]))
+                bgr = cv2.imread(str(image_path))
+                if bgr is not None:
+                    return filter_boxes(raw, bgr.shape[0], bgr.shape[1])
+        return None
 
-    builder = mp.Process(target=_shm_panel_producer,
-                         args=(shm.name, id_shm.name, write_idx, read_idx, done_flag,
-                               image_rows_ser, box_cache_dir, all_boxes_ser),
-                         daemon=True)
-    builder.start()
-    print(f"[TEXT SCORE] Panel builder started (PID {builder.pid})", file=sys.stderr)
-
-    # Consumer: GPU scoring from shared memory
-    doc_probs = {}
     results = {}
     total_panels = 0
     t0 = time.time()
-    batch_ids = []
-    batch_arrays = []
-    consumed = 0
 
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+    with torch.no_grad(), _autocast():
+        for idx, (image_id, image_path) in enumerate(tqdm(image_rows, desc="text score")):
+            boxes = _get_boxes(image_id, image_path)
+            if boxes is None or len(boxes) == 0:
+                results[image_id] = (0.0, 0)
+                continue
 
-    csv_path = Path(output_path).parent / "text_scores.csv" if output_path else None
-    csv_f = None
-    if csv_path:
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        csv_f = open(csv_path, 'w')
-        csv_f.write("id,text_prob,n_fields\n")
+            panels = extract_panels_for_doc(image_path, boxes)
+            if not panels:
+                results[image_id] = (0.0, 0)
+                continue
 
-    pbar = tqdm(desc="score panels", unit=" panels")
+            probs = []
+            for i in range(0, len(panels), batch_size):
+                batch_panels = panels[i:i + batch_size]
+                tensors = [preprocess_panel(p) for p in batch_panels]
+                x = torch.stack(tensors).to(DEVICE)
+                logits = model(x)
+                probs.extend(torch.sigmoid(logits).cpu().numpy().tolist())
 
-    def _agg_fn(pl):
-        pl.sort(reverse=True)
-        if agg == 'max': return pl[0]
-        if agg == 'top3': return float(np.mean(pl[:min(3, len(pl))]))
-        return float(np.mean(pl))
+            total_panels += len(panels)
 
-    def _flush_batch():
-        nonlocal total_panels
-        if not batch_arrays:
-            return
-        arr = np.stack(batch_arrays).astype(np.float32) / 255.0
-        arr = (arr - mean) / std
-        x = torch.from_numpy(arr).permute(0, 3, 1, 2).to(DEVICE)
-        with torch.no_grad(), _autocast():
-            probs = torch.sigmoid(model(x)).cpu().numpy().tolist()
-        for doc_id, prob in zip(batch_ids, probs):
-            doc_probs.setdefault(doc_id, []).append(prob)
-        total_panels += len(batch_arrays)
-        pbar.update(len(batch_arrays))
-        batch_ids.clear()
-        batch_arrays.clear()
+            probs_sorted = sorted(probs, reverse=True)
+            if agg == 'max':
+                score = probs_sorted[0]
+            elif agg == 'top3':
+                k = min(3, len(probs_sorted))
+                score = float(np.mean(probs_sorted[:k]))
+            else:
+                score = float(np.mean(probs_sorted))
+            results[image_id] = (score, len(panels))
 
-    def _flush_csv():
-        for did in list(doc_probs.keys()):
-            if did not in results:
-                p = doc_probs.pop(did)
-                results[did] = (_agg_fn(p), len(p))
-                if csv_f:
-                    csv_f.write(f"{did},{results[did][0]},{results[did][1]}\n")
-        if csv_f: csv_f.flush()
-        elapsed = time.time() - t0
-        print(f"  [flushed {len(results)} docs, {total_panels} panels, "
-              f"{total_panels/max(elapsed,1):.0f} panels/s]", file=sys.stderr)
+            if (idx + 1) % 500 == 0:
+                elapsed = time.time() - t0
+                rate = (idx + 1) / elapsed
+                eta = (len(image_rows) - idx - 1) / max(rate, 0.01)
+                print(f"  [{idx+1}/{len(image_rows)}] {total_panels} panels, "
+                      f"{total_panels/elapsed:.0f} panels/s, "
+                      f"{rate:.1f} img/s, ETA {eta/60:.0f}min", file=sys.stderr)
 
-    flush_counter = 0
-    while True:
-        if consumed < write_idx.value:
-            slot = consumed % RING_SIZE
-            panel = ring[slot].copy()
-            iid = bytes(id_arr[slot]).split(b'\x00')[0].decode('ascii')
-            read_idx.value = consumed + 1
-            consumed += 1
-
-            batch_ids.append(iid)
-            batch_arrays.append(panel)
-            if len(batch_arrays) >= batch_size:
-                _flush_batch()
-                flush_counter += batch_size
-                if flush_counter >= 200000:
-                    _flush_csv()
-                    flush_counter = 0
-        elif done_flag.value == 1 and consumed >= write_idx.value:
-            _flush_batch()
-            break
-        else:
-            time.sleep(0.0001)
-
-    _flush_csv()
-    if csv_f:
-        csv_f.close()
-        print(f"[TEXT SCORE] Scores → {csv_path}", file=sys.stderr)
-    pbar.close()
-    builder.join(timeout=10)
-
-    # Cleanup shared memory
-    shm.close(); shm.unlink()
-    id_shm.close(); id_shm.unlink()
-
-    elapsed = time.time() - t0
-    print(f"[TEXT SCORE] Scored {total_panels} panels in {elapsed:.0f}s "
-          f"({total_panels/max(elapsed,1):.0f} panels/s)", file=sys.stderr)
-
-    for image_id, _ in image_rows:
-        if image_id not in results:
-            results[image_id] = (0.0, 0)
-
-    del model; _empty_cache()
+    print(f"[TEXT SCORE] Done: {total_panels} panels from {len(image_rows)} docs", file=sys.stderr)
+    del model
+    _empty_cache()
     return results
 
 
