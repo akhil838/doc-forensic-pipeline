@@ -610,45 +610,65 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     total_panels = 0
     t0 = time.time()
 
-    with torch.no_grad(), _autocast():
-        for idx, (image_id, image_path) in enumerate(tqdm(image_rows, desc="text score")):
-            boxes = _get_boxes(image_id, image_path)
-            if boxes is None or len(boxes) == 0:
-                results[image_id] = (0.0, 0)
-                continue
+    # Accumulate panels across docs, score in fixed batches
+    batch_tensors = []
+    batch_ids = []
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+    doc_probs = {}  # image_id → [prob, ...]
 
-            panels = extract_panels_for_doc(image_path, boxes)
-            if not panels:
-                results[image_id] = (0.0, 0)
-                continue
+    def _flush():
+        nonlocal total_panels
+        if not batch_tensors:
+            return
+        arr = np.stack(batch_tensors).astype(np.float32) / 255.0
+        arr = (arr - mean) / std
+        x = torch.from_numpy(arr).permute(0, 3, 1, 2).to(DEVICE)
+        with torch.no_grad(), _autocast():
+            probs = torch.sigmoid(model(x)).cpu().numpy().tolist()
+        for doc_id, prob in zip(batch_ids, probs):
+            doc_probs.setdefault(doc_id, []).append(prob)
+        total_panels += len(batch_tensors)
+        batch_tensors.clear()
+        batch_ids.clear()
 
-            probs = []
-            for i in range(0, len(panels), batch_size):
-                batch_panels = panels[i:i + batch_size]
-                tensors = [preprocess_panel(p) for p in batch_panels]
-                x = torch.stack(tensors).to(DEVICE)
-                logits = model(x)
-                probs.extend(torch.sigmoid(logits).cpu().numpy().tolist())
+    for idx, (image_id, image_path) in enumerate(tqdm(image_rows, desc="text score")):
+        boxes = _get_boxes(image_id, image_path)
+        if boxes is None or len(boxes) == 0:
+            continue
+        panels = extract_panels_for_doc(image_path, boxes)
+        for panel in panels:
+            if panel.shape[:2] != (PANEL_H, PANEL_W):
+                panel = cv2.resize(panel, (PANEL_W, PANEL_H), interpolation=cv2.INTER_AREA)
+            batch_tensors.append(panel)
+            batch_ids.append(image_id)
+            if len(batch_tensors) >= batch_size:
+                _flush()
 
-            total_panels += len(panels)
+        if (idx + 1) % 500 == 0:
+            elapsed = time.time() - t0
+            rate = (idx + 1) / elapsed
+            eta = (len(image_rows) - idx - 1) / max(rate, 0.01)
+            print(f"  [{idx+1}/{len(image_rows)}] {total_panels} panels, "
+                  f"{total_panels/elapsed:.0f} panels/s, "
+                  f"{rate:.1f} img/s, ETA {eta/60:.0f}min", file=sys.stderr)
 
-            probs_sorted = sorted(probs, reverse=True)
-            if agg == 'max':
-                score = probs_sorted[0]
-            elif agg == 'top3':
-                k = min(3, len(probs_sorted))
-                score = float(np.mean(probs_sorted[:k]))
-            else:
-                score = float(np.mean(probs_sorted))
-            results[image_id] = (score, len(panels))
+    _flush()  # remaining panels
 
-            if (idx + 1) % 500 == 0:
-                elapsed = time.time() - t0
-                rate = (idx + 1) / elapsed
-                eta = (len(image_rows) - idx - 1) / max(rate, 0.01)
-                print(f"  [{idx+1}/{len(image_rows)}] {total_panels} panels, "
-                      f"{total_panels/elapsed:.0f} panels/s, "
-                      f"{rate:.1f} img/s, ETA {eta/60:.0f}min", file=sys.stderr)
+    # Aggregate per document
+    for image_id, _ in image_rows:
+        dp = doc_probs.get(image_id, [])
+        if not dp:
+            results[image_id] = (0.0, 0)
+            continue
+        dp.sort(reverse=True)
+        if agg == 'max':
+            score = dp[0]
+        elif agg == 'top3':
+            score = float(np.mean(dp[:min(3, len(dp))]))
+        else:
+            score = float(np.mean(dp))
+        results[image_id] = (score, len(dp))
 
     print(f"[TEXT SCORE] Done: {total_panels} panels from {len(image_rows)} docs", file=sys.stderr)
     del model
