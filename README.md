@@ -13,7 +13,7 @@ Two-branch fraud detection for identity documents: face/photo tampering + text f
 5. **ConvNeXt-Base** — panel → per-field tamper probability (1.5ms/field, GPU)
 6. **Score** — `fraud_score = max(photo_prob, max(field_probs))`
 
-Total inference: ~2.7h for 142k documents on A100.
+Total inference: ~6h for 135k documents on A100.
 
 ## Repository Structure
 
@@ -29,7 +29,7 @@ Total inference: ~2.7h for 142k documents on A100.
 │
 ├── models/
 │   ├── models.py                   # DINOv3Classifier, DINOClassifier
-│   └── weights/                    # Download from HuggingFace (see below)
+│   └── weights/                    # Via Git LFS (run `git lfs pull` after clone)
 │
 ├── train/
 │   ├── how_to_train.md              # Complete training guide
@@ -50,15 +50,15 @@ Total inference: ~2.7h for 142k documents on A100.
 
 ## Model Weights
 
-Download from HuggingFace:
+Weights are stored via Git LFS. After cloning, pull the actual files:
 
 ```bash
-pip install huggingface_hub
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download('akhil838/doc-forensic-models-v1', local_dir='models/weights')
-"
+git clone https://github.com/akhil838/doc-forensic-pipeline.git
+cd doc-forensic-pipeline
+git lfs pull
 ```
+
+Also available on HuggingFace: https://huggingface.co/akhil838/doc-forensic-models-v1
 
 | Weight | Size | Description |
 |--------|------|-------------|
@@ -67,13 +67,11 @@ snapshot_download('akhil838/doc-forensic-models-v1', local_dir='models/weights')
 | `blaze_face.tflite` | 225 KB | MediaPipe face detection |
 | `paddleocr_cache/` | 59 MB | PaddleOCR PP-OCRv6 detection model |
 
-Weights: https://huggingface.co/akhil838/doc-forensic-models-v1
-
 ## Docker Build & Run
 
 ```bash
-# Build (network available — downloads PyTorch, PaddlePaddle, caches HF models)
-docker build --build-arg HF_TOKEN=hf_xxx -t freuid-repro .
+# Build
+docker build -t freuid-repro .
 
 # Run (no network)
 docker run --rm --gpus all --network none \
@@ -87,7 +85,6 @@ Output: `/submissions/submission.csv` with columns `id,label`.
 ## Local Inference (without Docker)
 
 ```bash
-export HF_TOKEN=hf_your_token
 python inference/run_inference.py \
   --image-dir /path/to/images \
   --model-dir models/weights \
@@ -101,15 +98,14 @@ See [train/how_to_train.md](train/how_to_train.md) for complete instructions.
 
 ## Hardware
 
-- **Training**: Apple M3 Max (64GB RAM, MPS)
-- **Inference**: NVIDIA A100-PCIE-40GB (~2.7h for 142k docs)
-- **Also tested**: Kaggle T4 GPU
+- **Training**: Apple M3 Max (16-core CPU, 40-core GPU, 64GB unified RAM, MPS)
+- **Inference**: NVIDIA A100-SXM4-40GB, 16-core CPU, 120GB RAM, 130GB disk (~6h for 135k docs)
 
 ## External Resources
 
 | Resource | License | Usage |
 |----------|---------|-------|
-| `facebook/dinov3-convnext-base-pretrain-lvd1689m` | Apache 2.0 | Text classifier backbone |
+| `facebook/dinov3-convnext-base-pretrain-lvd1689m` | DINOv3 License (commercial OK) | Text classifier backbone |
 | `facebook/dinov2-small` | Apache 2.0 | Face classifier backbone |
 | PaddleOCR PP-OCRv6 | Apache 2.0 | Text field detection |
 | MediaPipe BlazeFace | Apache 2.0 | Face detection |
