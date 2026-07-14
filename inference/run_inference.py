@@ -566,35 +566,16 @@ def preprocess_panel(panel: np.ndarray) -> torch.Tensor:
     return (t - IMAGENET_MEAN.squeeze(0)) / IMAGENET_STD.squeeze(0)
 
 
-def _build_panels_for_doc(args):
-    """Worker function for ProcessPoolExecutor — builds panels for one doc."""
-    image_id, image_path, boxes = args
-    if boxes is None or len(boxes) == 0:
-        return []
-    rgb = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
-    H, W = rgb.shape[:2]
-    results = []
-    for x0, y0, x1, y1 in boxes:
-        cx0, cy0 = max(0, int(x0) - PAD_X), max(0, int(y0) - PAD_Y)
-        cx1, cy1 = min(W, int(x1) + PAD_X), min(H, int(y1) + PAD_Y)
-        crop = rgb[cy0:cy1, cx0:cx1]
-        if crop.shape[0] >= 6 and crop.shape[1] >= 6:
-            panel = forensic_panel_from_crop(crop)
-            # Preprocess to tensor-ready numpy (avoid torch in subprocess)
-            if panel.shape[:2] != (PANEL_H, PANEL_W):
-                panel = cv2.resize(panel, (PANEL_W, PANEL_H), interpolation=cv2.INTER_AREA)
-            panel_f = panel.astype(np.float32) / 255.0
-            results.append((image_id, panel_f))
-    return results
+def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3',
+                     box_cache_dir=None):
+    """Step 4: Streaming text scoring — minimal memory.
 
-
-def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'):
-    """Step 4: ProcessPool panel generation (true parallelism) + GPU scoring.
-
-    ProcessPoolExecutor bypasses GIL for CPU-bound forensic panel generation.
-    Panels stream through a queue to GPU scoring with fixed batch sizes.
+    - Loads boxes per-doc from cache or all_boxes dict
+    - 4 threads build panels → bounded queue (128) → GPU scores fixed batches
+    - No large dicts held in memory
     """
     import queue, threading
+    from concurrent.futures import ThreadPoolExecutor
 
     # Load model
     weights = model_dir / "dinov3_convnext_base_tamper_clf.pt"
@@ -612,21 +593,35 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     print(f"[TEXT SCORE] Loaded {weights} ({params_m:.1f}M params, "
           f"batch_size={batch_size}, FP16={USE_FP16}, compiled={DEVICE=='cuda'})", file=sys.stderr)
 
-    # Prepare work items: (image_id, image_path, boxes)
-    work_items = [(iid, str(ip), all_boxes.get(iid))
-                  for iid, ip in image_rows
-                  if all_boxes.get(iid) is not None and len(all_boxes.get(iid, [])) > 0]
-    print(f"[TEXT SCORE] Processing {len(work_items)} docs with fields "
-          f"({len(image_rows) - len(work_items)} without)", file=sys.stderr)
+    # --- Producer: load boxes per-doc from cache, build panels ---
+    panel_q = queue.Queue(maxsize=128)
+    cache_dir = Path(box_cache_dir) if box_cache_dir else None
 
-    # --- Producer: ThreadPool builds panels, feeds queue ---
-    panel_q = queue.Queue(maxsize=1024)
+    def _get_boxes_for_doc(image_id, image_path):
+        if all_boxes and image_id in all_boxes:
+            return all_boxes[image_id]
+        if cache_dir:
+            cache_file = cache_dir / f"{image_id}.npy"
+            size_file = cache_dir / f"{image_id}_size.npy"
+            if cache_file.exists():
+                raw = np.load(cache_file, allow_pickle=False)
+                if size_file.exists():
+                    sz = np.load(size_file)
+                    return filter_boxes(raw, int(sz[0]), int(sz[1]))
+                bgr = cv2.imread(str(image_path))
+                if bgr is not None:
+                    return filter_boxes(raw, bgr.shape[0], bgr.shape[1])
+        return None
 
     def _build_and_enqueue(args):
-        image_id, image_path, boxes = args
+        image_id, image_path = args
+        boxes = _get_boxes_for_doc(image_id, image_path)
         if boxes is None or len(boxes) == 0:
             return
-        rgb = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
+        bgr = cv2.imread(str(image_path))
+        if bgr is None:
+            return
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         H, W = rgb.shape[:2]
         for x0, y0, x1, y1 in boxes:
             cx0, cy0 = max(0, int(x0) - PAD_X), max(0, int(y0) - PAD_Y)
@@ -637,25 +632,24 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
                 if panel.shape[:2] != (PANEL_H, PANEL_W):
                     panel = cv2.resize(panel, (PANEL_W, PANEL_H), interpolation=cv2.INTER_AREA)
                 panel_q.put((image_id, panel.astype(np.float32) / 255.0))
+        del bgr, rgb
 
     def _producer():
-        n_workers = min(16, max(1, (os.cpu_count() or 4)))
-        from concurrent.futures import ThreadPoolExecutor
+        n_workers = min(4, max(1, (os.cpu_count() or 4)))
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            list(pool.map(_build_and_enqueue, work_items, chunksize=8))
+            list(pool.map(_build_and_enqueue, image_rows))
         panel_q.put(None)
 
     producer = threading.Thread(target=_producer, daemon=True)
     producer.start()
 
     # --- Consumer: GPU scoring with fixed batches ---
-    all_predictions = {}
+    doc_predictions = {}
     total_panels = 0
     t0 = time.time()
     batch_ids = []
     batch_arrays = []
 
-    # ImageNet normalization
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
 
@@ -665,15 +659,14 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
         nonlocal batch_ids, batch_arrays, total_panels
         if not batch_arrays:
             return
-        # Normalize and convert to tensor
-        arr = np.stack(batch_arrays)  # (B, H, W, 3)
+        arr = np.stack(batch_arrays)
         arr = (arr - mean) / std
-        x = torch.from_numpy(arr).permute(0, 3, 1, 2).to(DEVICE)  # (B, 3, H, W)
+        x = torch.from_numpy(arr).permute(0, 3, 1, 2).to(DEVICE)
         with torch.no_grad(), _autocast():
             logits = model(x)
             probs = torch.sigmoid(logits).cpu().numpy().tolist()
         for doc_id, prob in zip(batch_ids, probs):
-            all_predictions.setdefault(doc_id, []).append(prob)
+            doc_predictions.setdefault(doc_id, []).append(prob)
         total_panels += len(batch_arrays)
         pbar.update(len(batch_arrays))
         batch_ids = []
@@ -700,7 +693,7 @@ def run_text_scoring(image_rows, all_boxes, model_dir, batch_size=32, agg='top3'
     # --- Aggregate per document ---
     results = {}
     for image_id, _ in image_rows:
-        doc_probs = all_predictions.get(image_id, [])
+        doc_probs = doc_predictions.get(image_id, [])
         if not doc_probs:
             results[image_id] = (0.0, 0)
             continue
@@ -853,9 +846,8 @@ def main():
         t_det = time.time() - t2
         print(f"[STEP 3] Text detection done in {t_det:.0f}s ({t_det/60:.1f}min)", file=sys.stderr)
     elif run_steps == "text-score" and args.box_cache:
-        # Load cached boxes for scoring-only mode
-        all_boxes = run_text_detection(image_rows, box_cache_dir=args.box_cache)
-        print(f"[STEP 3] Loaded boxes from cache", file=sys.stderr)
+        # Don't load all boxes — scoring will stream from cache per-doc
+        print(f"[STEP 3] Boxes will be loaded per-doc from {args.box_cache}", file=sys.stderr)
 
     # Step 4: text field scoring
     text_results = {}
@@ -863,7 +855,8 @@ def main():
     if run_steps in ("all", "text", "text-score"):
         t3 = time.time()
         text_results = run_text_scoring(image_rows, all_boxes, model_dir,
-                                        batch_size=args.text_batch_size, agg=args.agg)
+                                        batch_size=args.text_batch_size, agg=args.agg,
+                                        box_cache_dir=args.box_cache)
         t_score = time.time() - t3
         print(f"[STEP 4] Text scoring done in {t_score:.0f}s ({t_score/60:.1f}min)", file=sys.stderr)
 
